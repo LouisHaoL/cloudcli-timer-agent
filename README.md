@@ -20,11 +20,15 @@ Scheduled Prompt 只支持 daily/weekly/monthly 等预设枚举,**不支持 cron
 ## 安装
 
 ```sh
-# 方式一:clone 到 CloudCLI 插件目录后构建
-git clone <本仓库路径> ~/.claude-code-ui/plugins/cloudcli-plugin-timer-agent
+# 方式一:作为插件市场添加(推荐)
+claude plugin marketplace add LouisHaoL/cloudcli-timer-agent
+claude plugin install cloudcli-timer-agent
+
+# 方式二:clone 到 CloudCLI 插件目录后构建
+git clone https://github.com/LouisHaoL/cloudcli-timer-agent ~/.claude-code-ui/plugins/cloudcli-plugin-timer-agent
 npm install && npm run build
 
-# 方式二:本目录已构建好,直接拷贝/链接到 ~/.claude-code-ui/plugins/ 即可
+# 方式三:本目录已构建好,直接拷贝/链接到 ~/.claude-code-ui/plugins/ 即可
 ```
 
 重启 CloudCLI,插件页出现「Timer Agent」标签即生效。

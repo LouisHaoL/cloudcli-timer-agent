@@ -1,0 +1,26 @@
+{
+  "name": "cloudcli-timer-agent",
+  "owner": {
+    "name": "LouisHaoL",
+    "url": "https://github.com/LouisHaoL"
+  },
+  "metadata": {
+    "description": "Scheduled AI agent prompts & command jobs for CloudCLI.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "cloudcli-timer-agent",
+      "source": "./",
+      "description": "Cron & fixed-interval scheduler for AI agent prompts and command jobs, with a full management board (create/edit/detail/history).",
+      "version": "0.1.0",
+      "author": {
+        "name": "LouisHaoL"
+      },
+      "category": "productivity",
+      "keywords": ["cron", "scheduler", "timer", "automation", "agent"],
+      "homepage": "https://github.com/LouisHaoL/cloudcli-timer-agent",
+      "license": "MIT"
+    }
+  ]
+}
