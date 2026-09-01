@@ -1,6 +1,6 @@
 {
   "name": "cloudcli-plugin-timer-agent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "CloudCLI plugin: cron-scheduled AI agent prompts and command jobs (dsh-timer-agent port).",
   "type": "module",

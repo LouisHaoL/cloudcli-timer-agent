@@ -4,15 +4,20 @@
  * with one stdout JSON line `{"ready":true,"port":N}` (cloudcli-cron
  * handshake). Also runnable standalone (`node dist/server.js`) for
  * development / CLI-side management — the host instance and a standalone
- * instance share the same ledger file, so run at most one to avoid
- * double-firing.
+ * instance share the same ledger file, so the lock in {@link acquireInstanceLock}
+ * enforces "run at most one" instead of relying on discipline.
  */
 import { startHttpServer, loadProfile } from './server/http.js';
 import { tick } from './server/scheduler.js';
 import { JobStore } from './server/store.js';
+import { acquireInstanceLock } from './server/lock.js';
 /** Ticker cadence (ms); cron is minute-granular so 30s never misses a point. */
 const TICK_INTERVAL_MS = 30_000;
 async function main() {
+    if (!(await acquireInstanceLock())) {
+        process.stderr.write('[timer-agent] another scheduler instance is already running for this data directory; exiting\n');
+        process.exit(1);
+    }
     const store = new JobStore();
     const profile = await loadProfile();
     const server = await startHttpServer({ store, tick: () => tick(store, profile) });
