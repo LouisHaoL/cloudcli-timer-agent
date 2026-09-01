@@ -1,0 +1,20 @@
+{
+  "name": "cloudcli-plugin-timer-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CloudCLI plugin: cron-scheduled AI agent prompts and command jobs (dsh-timer-agent port).",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && esbuild src/index.ts --bundle --format=esm --platform=browser --outfile=dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "esbuild": "^0.25.11",
+    "typescript": "^5.9.3"
+  }
+}

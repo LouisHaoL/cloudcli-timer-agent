@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>timer-agent harness</title></head>
+<body style="margin:0;background:#141414;color:#eee;font-family:sans-serif">
+<div id="root" style="height:100vh;overflow:auto"></div>
+<script type="module">
+  // Minimal stand-in for the host PluginAPI: rpc → standalone plugin server.
+  const port = new URLSearchParams(location.search).get('port') ?? '0'
+  const api = {
+    context: { theme: 'dark', project: { name: 'demo', path: 'D:\\demo' }, session: null },
+    onContextChange: () => () => {},
+    async rpc(method, path, body) {
+      const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+        headers: body !== undefined ? { 'content-type': 'application/json' } : undefined,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      })
+      if (res.status === 204) return undefined
+      const text = await res.text()
+      if (!res.ok) throw new Error(`${res.status} ${text}`)
+      return text === '' ? undefined : JSON.parse(text)
+    },
+  }
+  const mod = await import('./index.js')
+  await mod.mount(document.getElementById('root'), api)
+</script>
+</body>
+</html>
