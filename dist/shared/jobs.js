@@ -14,6 +14,18 @@
 export function jobKind(job) {
     return job.kind === 'command' ? 'command' : 'agent';
 }
+/** Clamp a dispatch priority to 1..5 (default 3). */
+export function normalizePriority(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value))
+        return 3;
+    return Math.max(1, Math.min(5, Math.round(value)));
+}
+/** Clamp a dispatch difficulty to 1..5 (default 3). */
+export function normalizeDifficulty(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value))
+        return 3;
+    return Math.max(1, Math.min(5, Math.round(value)));
+}
 export const ALL_STATUSES = ['idle', 'running', 'done', 'failed', 'archived'];
 export function isJobStatus(value) {
     return typeof value === 'string' && ALL_STATUSES.includes(value);
@@ -49,6 +61,8 @@ export function createJob(input, now, id) {
     };
     if (input.workdir?.trim())
         job.workdir = input.workdir.trim();
+    if (input.tool?.trim())
+        job.tool = input.tool.trim();
     if (input.model?.trim())
         job.model = input.model.trim();
     if (input.effort?.trim())
@@ -64,6 +78,14 @@ export function createJob(input, now, id) {
         job.session = input.session.trim();
     if (input.timeoutMs && input.timeoutMs > 0)
         job.timeoutMs = Math.round(input.timeoutMs);
+    if (input.inbox === true)
+        job.inbox = true;
+    if (input.priority !== undefined || input.difficulty !== undefined) {
+        job.priority = normalizePriority(input.priority);
+        job.difficulty = normalizeDifficulty(input.difficulty);
+    }
+    if (input.targetProject?.trim())
+        job.targetProject = input.targetProject.trim();
     return job;
 }
 /** A command job's display/exec line (agent jobs → ''). */

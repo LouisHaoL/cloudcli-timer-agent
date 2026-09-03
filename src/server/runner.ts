@@ -13,6 +13,8 @@
  */
 import { spawn } from 'node:child_process'
 import { appendCapped, splitCommandArgs, truncateOutputTail } from '../shared/command.js'
+import type { AgentToolDef } from '../shared/agents.js'
+import { resolveAgentTool } from '../shared/agents.js'
 import type { CliProfile, JobRecord } from '../shared/jobs.js'
 import { jobKind } from '../shared/jobs.js'
 
@@ -36,8 +38,10 @@ export const DEFAULT_EFFORT = 'medium'
 
 export const DEFAULT_PROFILE: ServerProfile = {
   // Prefer absolute paths: the plugin server's PATH is often incomplete.
+  // Unattended runs: skip permission prompts (an approval would just hang
+  // until the timeout kills the run).
   command: process.env.TIMER_AGENT_CLI ?? 'claude',
-  args: '--print',
+  args: '--print --permission-mode bypassPermissions',
   model: DEFAULT_MODEL,
   effort: DEFAULT_EFFORT,
 }
@@ -68,11 +72,12 @@ export function renderTemplate(
     name in replacements ? replacements[name]! : whole)
 }
 
-/** Resolve the effective CLI profile for an agent job. */
-export function resolveProfile(job: JobRecord, serverProfile: ServerProfile): { command: string; args: string; timeoutMs: number } {
+/** Resolve the effective CLI profile for an agent job (cli override → tool catalog → server default). */
+export function resolveProfile(job: JobRecord, serverProfile: ServerProfile): { command: string; args: string; timeoutMs: number; tool: AgentToolDef | undefined } {
   const override = job.cli
-  const command = override?.command?.trim() || serverProfile.command
-  const args = override?.args?.trim() || serverProfile.args
+  const tool = resolveAgentTool(job.tool)
+  const command = override?.command?.trim() || tool?.command || serverProfile.command
+  const args = override?.args?.trim() || tool?.args || serverProfile.args
   const timeoutMs = job.timeoutMs && job.timeoutMs > 0
     ? job.timeoutMs
     : override?.timeoutMs && override.timeoutMs > 0
@@ -80,7 +85,7 @@ export function resolveProfile(job: JobRecord, serverProfile: ServerProfile): { 
       : serverProfile.timeoutMs && serverProfile.timeoutMs > 0
         ? serverProfile.timeoutMs
         : DEFAULT_TIMEOUT_MS
-  return { command, args, timeoutMs }
+  return { command, args, timeoutMs, tool }
 }
 
 /** Run one job attempt and settle into a {@link RunOutcome}. */
@@ -101,11 +106,32 @@ function runAgent(job: JobRecord, serverProfile: ServerProfile, scheduledFor: nu
   const usesPlaceholder = /\{\{\s*prompt\s*\}\}/.test(template)
   const argv = splitCommandArgs(renderTemplate(template, { prompt, job, scheduledFor }))
   // Model + thinking level (same mechanism scheduled-prompt uses: plain CLI
-  // flags). Skipped when the args template already carries the flag itself.
-  const model = job.model?.trim() || serverProfile.model?.trim() || DEFAULT_MODEL
+  // flags). Skipped when the args template already carries the flag itself;
+  // the effort syntax follows the tool (claude flag / codex config / opencode variant).
+  // Model precedence: job → tool default → server profile, but only when the
+  // tool inherits the server default — codex/opencode read their own configs,
+  // so an injected default would override a config the user never asked us to.
+  const jobModel = job.model?.trim()
+  let model: string | undefined
+  if (jobModel !== undefined && jobModel !== '') model = jobModel
+  else if (profile.tool?.defaultModel !== undefined) model = profile.tool.defaultModel
+  else if (profile.tool?.inheritServerModel !== false) model = serverProfile.model?.trim() || DEFAULT_MODEL
   const effort = job.effort?.trim() || serverProfile.effort?.trim() || DEFAULT_EFFORT
-  if (!argv.includes('--model')) argv.push('--model', model)
-  if (!argv.includes('--effort')) argv.push('--effort', effort)
+  const modelFlag = profile.tool?.modelFlag ?? '--model'
+  if (model !== undefined && !argv.includes(modelFlag)) argv.push(modelFlag, model)
+  const effortStyle = profile.tool?.effortStyle ?? 'flag'
+  if (effortStyle === 'flag' && !argv.includes('--effort')) argv.push('--effort', effort)
+  else if (effortStyle === 'config' && !argv.some(arg => arg.startsWith('model_reasoning_effort='))) {
+    argv.push('-c', `model_reasoning_effort=${effort}`)
+  } else if (effortStyle === 'variant' && !argv.includes('--variant')) argv.push('--variant', effort)
+  // Pinned session continuity, per tool: claude `--resume <id>` /
+  // opencode `--session <id>` trailing, codex `exec resume <id>` inserted
+  // after the first token. Skipped when the template carries {{session}}.
+  const session = job.session?.trim()
+  if (session !== undefined && session !== '' && !/\{\{\s*session\s*\}\}/.test(template)) {
+    if (profile.tool?.resumeSubcommand !== undefined) argv.splice(1, 0, profile.tool.resumeSubcommand, session)
+    else argv.push(profile.tool?.sessionFlag ?? '--resume', session)
+  }
   if (profile.command.trim() === '') {
     return Promise.resolve({ result: 'failed', error: 'CLI profile has no command', exitCode: undefined, output: '', sessionId: undefined })
   }

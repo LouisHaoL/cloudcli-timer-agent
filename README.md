@@ -12,6 +12,7 @@ Scheduled Prompt 只支持 daily/weekly/monthly 等预设枚举,**不支持 cron
   - **普通任务(命令)**:到点直接 spawn `命令 + 参数`(不经过 AI、不消耗额度),stdout/stderr 尾部(≤16k 字符)与退出码入账
 - **跳过一次**:详情页一键跳过下一个触发点,之后照常
 - **执行历史**:每次触发的结果/耗时/输出尾部/错误原因(上限 200 条)
+- **收件箱自动派发**:`inbox: true` 的任务进入队列,按 `priority`+`difficulty`+等待时长打分,空闲时自动跑最高分;可用 `targetProject` 指定执行所在目录
 - **立即执行 / 暂停 / 恢复 / 归档 / 搜索**
 
 > [!WARNING]
@@ -30,6 +31,8 @@ npm install && npm run build
 
 # 方式三:本目录已构建好,直接拷贝/链接到 ~/.claude-code-ui/plugins/ 即可
 ```
+
+插件目录、服务器端路由判定均由此目录加载(`~/.claude-code-ui/plugins/`);server 的台账则在 `~/.cloudcli-timer-agent/jobs.json`(可用环境变量 `TIMER_AGENT_HOME` 覆盖,冒烟测试即用临时目录)。
 
 重启 CloudCLI,插件页出现「Timer Agent」标签即生效。
 
@@ -60,6 +63,7 @@ npm install && npm run build
 | DELETE | `/v1/jobs/:id` | 删除 |
 | POST | `/v1/jobs/:id/actions/{pause,resume,run-now,archive,restart}` | 操作 |
 | GET/PUT | `/v1/profile` | server 默认 CLI 执行档 |
+| GET/PUT | `/v1/dispatch` | 读取/保存派发策略与队首任务预览 |
 
 独立调试:`node dist/server.js`,stdout 首行 `{"ready":true,"port":N}`(cloudcli-cron 同款握手)。注意 host 实例与独立实例共用一份台账,**别同时跑两个**,避免重复触发。
 
@@ -73,12 +77,14 @@ src/
 ├── shared/
 │   ├── schedule.ts    # 5 段 cron 解析 + nextRunAt(移植自 dsh-timer-agent)
 │   ├── jobs.ts        # 任务域模型 + 状态机(移植 + 跳过一次/触发来源)
-│   └── command.ts     # 引号感知参数切分 + 输出截尾(移植)
+│   ├── command.ts     # 引号感知参数切分 + 输出截尾(移植)
+│   └── scoring.ts     # 收件箱打分(priority+difficulty+等待时长)
 ├── server.ts          # server 入口:握手 + 30s ticker
 ├── server/
 │   ├── store.ts       # ~/.cloudcli-timer-agent/jobs.json 原子写 + 损坏降级
 │   ├── scheduler.ts   # at-most-once 调度 / runRequestedAt 手动通道 / skip-once
 │   ├── runner.ts      # spawn 执行(agent 模板/stdin + command),超时/结算
+│   ├── dispatch.ts    # 收件箱派发策略持久化 + 队首候选挑选
 │   └── http.ts        # 回环 HTTP API
 └── client/
     ├── api.ts         # api.rpc 封装

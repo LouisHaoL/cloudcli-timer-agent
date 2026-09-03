@@ -23,7 +23,7 @@ export function jobKind(job: Pick<JobRecord, 'kind'>): JobKind {
 }
 
 /** How one execution was triggered. */
-export type TriggerSource = 'scheduled' | 'manual' | 'retry'
+export type TriggerSource = 'scheduled' | 'manual' | 'dispatch' | 'retry'
 
 /**
  * One real execution attempt: outcome, captured output tail (command runs /
@@ -89,6 +89,8 @@ export interface JobRecord {
   status: JobStatus
   /** Working directory for the spawned process (blank → server cwd). */
   workdir?: string
+  /** Agent jobs: which agent CLI to run (see shared/agents.ts); absent → server profile default. */
+  tool?: string
   /** Agent jobs: per-job CLI profile override. */
   cli?: CliProfile
   /** Agent jobs: pin a conversation id to continue across runs. */
@@ -99,6 +101,23 @@ export interface JobRecord {
   model?: string
   /** Agent jobs: `--effort` (thinking level) override; absent → profile default. */
   effort?: string
+  /**
+   * Inbox / automatic-dispatch marker. A job with `inbox: true` is a queued
+   * task that the scheduler picks up when the process is otherwise idle; it
+   * does not need a cron/interval schedule. The scheduler scores queued jobs
+   * by `priority` + `difficulty` + age and runs the highest score.
+   */
+  inbox?: boolean
+  /** 1 (low) … 5 (high). Weighted heavily in dispatch scoring. */
+  priority?: number
+  /** 1 (easy) … 5 (hard). Used as a tiebreak / risk factor in dispatch scoring. */
+  difficulty?: number
+  /**
+   * Project workdir chosen at dispatch time. If set, the job is executed in
+   * this directory (it overrides `workdir`); the "inbox" task itself can live
+   * in one project but be routed to another to actually work.
+   */
+  targetProject?: string
   createdAt: number
   updatedAt: number
   /** Every execution attempt, most recent last. */
@@ -117,6 +136,8 @@ export interface NewJobInput {
   command?: string
   args?: string
   workdir?: string
+  /** Agent jobs: agent CLI id ('claude' | 'codex' | 'opencode'; blank → server default). */
+  tool?: string
   cli?: CliProfile
   session?: string
   timeoutMs?: number
@@ -129,6 +150,26 @@ export interface NewJobInput {
   /** Fixed-interval alternative to `cron` (minutes from the last trigger). */
   intervalMinutes?: number
   enabled?: boolean
+  /** Queue this job for automatic idle dispatch (no cron/interval needed). */
+  inbox?: boolean
+  /** 1 (low) … 5 (high) dispatch priority. */
+  priority?: number
+  /** 1 (easy) … 5 (hard) dispatch difficulty. */
+  difficulty?: number
+  /** Project workdir chosen at dispatch time (overrides `workdir`). */
+  targetProject?: string
+}
+
+/** Clamp a dispatch priority to 1..5 (default 3). */
+export function normalizePriority(value: number | undefined | null): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 3
+  return Math.max(1, Math.min(5, Math.round(value)))
+}
+
+/** Clamp a dispatch difficulty to 1..5 (default 3). */
+export function normalizeDifficulty(value: number | undefined | null): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 3
+  return Math.max(1, Math.min(5, Math.round(value)))
 }
 
 export const ALL_STATUSES: readonly JobStatus[] = ['idle', 'running', 'done', 'failed', 'archived']
@@ -167,6 +208,7 @@ export function createJob(input: NewJobInput, now: number, id: string): JobRecor
       : {}),
   }
   if (input.workdir?.trim()) job.workdir = input.workdir.trim()
+  if (input.tool?.trim()) job.tool = input.tool.trim()
   if (input.model?.trim()) job.model = input.model.trim()
   if (input.effort?.trim()) job.effort = input.effort.trim()
   if (input.cli && (input.cli.command?.trim() || input.cli.args?.trim())) {
@@ -178,6 +220,12 @@ export function createJob(input: NewJobInput, now: number, id: string): JobRecor
   }
   if (input.session?.trim()) job.session = input.session.trim()
   if (input.timeoutMs && input.timeoutMs > 0) job.timeoutMs = Math.round(input.timeoutMs)
+  if (input.inbox === true) job.inbox = true
+  if (input.priority !== undefined || input.difficulty !== undefined) {
+    job.priority = normalizePriority(input.priority)
+    job.difficulty = normalizeDifficulty(input.difficulty)
+  }
+  if (input.targetProject?.trim()) job.targetProject = input.targetProject.trim()
   return job
 }
 

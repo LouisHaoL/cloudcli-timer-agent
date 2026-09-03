@@ -29,8 +29,11 @@ export interface TargetGroupRow {
 }
 
 /** Cap the scan: recent files only, recent sessions per group only. */
-const MAX_FILES = 300
-const SESSIONS_PER_GROUP = 20
+const MAX_FILES = 600
+const SESSIONS_PER_GROUP = 50
+/** Head-scan budget: meta lines can precede the first real transcript record. */
+const HEAD_LINES = 8
+const HEAD_LIMIT = 262_144
 
 /** Last non-empty path segment (both separators), for short labels. */
 function pathBasename(path: string): string {
@@ -58,23 +61,31 @@ function firstUserText(line: unknown): string {
   return clean.length > 80 ? `${clean.slice(0, 80)}…` : clean
 }
 
-/** Extract {id, title, cwd} from a transcript's first line (null = skip). */
-function parseFirstLine(raw: string, fallbackId: string): { id: string; title: string; cwd: string } | null {
-  try {
-    const line = JSON.parse(raw.slice(0, raw.indexOf('\n') === -1 ? raw.length : raw.indexOf('\n'))) as {
-      sessionId?: string
-      cwd?: string
-      isSidechain?: boolean
-      message?: unknown
+/**
+ * Extract {id, title, cwd} from a transcript head (null = skip). Newer
+ * transcripts open with meta lines (`queue-operation`, …) that carry no cwd,
+ * so scan the head line-by-line and take cwd / title / sessionId from the
+ * first line that has each; a transcript that stays sidechain-only is skipped.
+ */
+function parseHead(raw: string, fallbackId: string): { id: string; title: string; cwd: string } | null {
+  let cwd: string | null = null
+  let id: string | null = null
+  let title = ''
+  for (const lineText of raw.split('\n')) {
+    if (lineText.trim() === '') continue
+    let line: { sessionId?: string; cwd?: string; isSidechain?: boolean; message?: unknown }
+    try {
+      line = JSON.parse(lineText) as typeof line
+    } catch {
+      continue
     }
-    if (line.isSidechain === true) return null
-    const cwd = typeof line.cwd === 'string' && line.cwd.trim() !== '' ? line.cwd.trim() : null
-    if (cwd === null) return null
-    const id = typeof line.sessionId === 'string' && line.sessionId !== '' ? line.sessionId : fallbackId
-    return { id, title: firstUserText(line) || id, cwd }
-  } catch {
-    return null
+    if (cwd === null && typeof line.cwd === 'string' && line.cwd.trim() !== '') cwd = line.cwd.trim()
+    if (id === null && typeof line.sessionId === 'string' && line.sessionId !== '') id = line.sessionId
+    if (title === '' && line.isSidechain !== true) title = firstUserText(line)
+    if (cwd !== null && id !== null && title !== '') break
   }
+  if (cwd === null) return null
+  return { id: id ?? fallbackId, title: title || id || fallbackId, cwd }
 }
 
 /** Enumerate workspace groups with their pinnable sessions. */
@@ -113,16 +124,29 @@ export async function listTargetGroups(): Promise<TargetGroupRow[]> {
     try {
       const handle = await open(candidate.file, 'r')
       try {
+        // Read the transcript head (meta lines can precede the first real
+        // record). Chunks are copied because `buffer` is reused per read;
+        // line boundaries across chunk edges are handled by split('\n').
         const buffer = Buffer.alloc(16_384)
-        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
-        raw = buffer.subarray(0, bytesRead).toString('utf8')
+        const chunks: Buffer[] = []
+        let offset = 0
+        let newlines = 0
+        while (offset < HEAD_LIMIT && newlines < HEAD_LINES) {
+          const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, HEAD_LIMIT - offset), offset)
+          if (bytesRead === 0) break
+          const slice = buffer.subarray(0, bytesRead)
+          newlines += slice.filter(byte => byte === 10).length
+          chunks.push(Buffer.from(slice))
+          offset += bytesRead
+        }
+        raw = Buffer.concat(chunks).toString('utf8')
       } finally {
         await handle.close()
       }
     } catch {
       continue
     }
-    const parsed = parseFirstLine(raw, pathBasename(candidate.file).replace(/\.jsonl$/, ''))
+    const parsed = parseHead(raw, pathBasename(candidate.file).replace(/\.jsonl$/, ''))
     if (parsed === null) continue
     const key = normPath(parsed.cwd)
     const bucket = buckets.get(key) ?? { workdir: parsed.cwd, sessions: [] }

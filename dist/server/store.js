@@ -9,7 +9,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { isValidCron } from '../shared/schedule.js';
-import { isJobStatus } from '../shared/jobs.js';
+import { isJobStatus, normalizeDifficulty, normalizePriority } from '../shared/jobs.js';
 /** Data directory (TIMER_AGENT_HOME overrides, for tests/harnesses). */
 export function dataDir() {
     return process.env.TIMER_AGENT_HOME ?? join(homedir(), '.cloudcli-timer-agent');
@@ -101,6 +101,10 @@ function repairJob(value) {
         ...(typeof record.session === 'string' && record.session ? { session: record.session } : {}),
         ...(typeof record.model === 'string' && record.model.trim() !== '' ? { model: record.model.trim() } : {}),
         ...(typeof record.effort === 'string' && record.effort.trim() !== '' ? { effort: record.effort.trim() } : {}),
+        ...(typeof record.priority === 'number' ? { priority: normalizePriority(record.priority) } : {}),
+        ...(typeof record.difficulty === 'number' ? { difficulty: normalizeDifficulty(record.difficulty) } : {}),
+        ...(record.inbox === true ? { inbox: true } : {}),
+        ...(typeof record.targetProject === 'string' && record.targetProject !== '' ? { targetProject: record.targetProject } : {}),
         ...(typeof record.timeoutMs === 'number' && record.timeoutMs > 0
             ? { timeoutMs: Math.round(record.timeoutMs) } : {}),
         createdAt: record.createdAt,

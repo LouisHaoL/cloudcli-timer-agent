@@ -11,12 +11,15 @@ import { join } from 'node:path'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { intervalNextMs, isIntervalRule, isValidCron, nextRunAtMs, scheduleNextMs } from '../shared/schedule.js'
 import type { JobRecord, NewJobInput, ScheduleRule } from '../shared/jobs.js'
-import { createJob, jobKind, withSchedule, withStatus } from '../shared/jobs.js'
+import { createJob, jobKind, normalizeDifficulty, normalizePriority, withSchedule, withStatus } from '../shared/jobs.js'
 import type { JobStore } from './store.js'
 import { defaultProfileFile } from './store.js'
 import type { ServerProfile } from './runner.js'
 import { DEFAULT_PROFILE } from './runner.js'
 import { listTargetGroups } from './targets.js'
+import { listHostModels } from './models.js'
+import { loadDispatchPolicy, nextInboxCandidate, parseDispatchPolicy, saveDispatchPolicy } from './dispatch.js'
+import { scoreDispatch } from '../shared/scoring.js'
 
 export interface HttpAppOptions {
   store: JobStore
@@ -160,6 +163,10 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     return send(response, 200, { groups: await listTargetGroups() })
   }
 
+  if (method === 'GET' && path === '/v1/models') {
+    return send(response, 200, { models: await listHostModels() })
+  }
+
   if (path === '/v1/profile') {
     if (method === 'GET') return send(response, 200, { profile: await loadProfile() })
     if (method === 'PUT') {
@@ -177,6 +184,37 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
       }
       await saveProfile(profile)
       return send(response, 200, { profile })
+    }
+  }
+
+  if (path === '/v1/dispatch') {
+    if (method === 'GET') {
+      const policy = await loadDispatchPolicy()
+      const jobs = await store.load()
+      const running = jobs.filter(job => job.status === 'running').length
+      const next = nextInboxCandidate(jobs, policy, Date.now())
+      const nextScore = next === undefined ? undefined : scoreDispatch(next, policy, Date.now())
+      return send(response, 200, {
+        policy,
+        status: {
+          running,
+          queued: jobs.filter(job => job.inbox === true && job.status === 'idle').length,
+          next: next === undefined ? null : {
+            id: next.id,
+            title: next.title,
+            priority: next.priority ?? 3,
+            difficulty: next.difficulty ?? 3,
+            score: Math.round(nextScore!),
+            targetProject: next.targetProject,
+          },
+        },
+      })
+    }
+    if (method === 'PUT') {
+      const body = await readBody(request)
+      const policy = parseDispatchPolicy(body)
+      await saveDispatchPolicy(policy)
+      return send(response, 200, { policy })
     }
   }
 
@@ -198,12 +236,15 @@ async function create(response: ServerResponse, store: JobStore, body: Partial<N
   const interval = body?.intervalMinutes !== undefined && body.intervalMinutes > 0
     ? Math.round(body.intervalMinutes)
     : undefined
-  if (cron === '' && interval === undefined) throw new ApiError(400, 'cron or intervalMinutes is required')
+  const inbox = body?.inbox === true
+  if (cron === '' && interval === undefined && !inbox) throw new ApiError(400, 'cron, intervalMinutes, or inbox is required')
   const kind = body?.kind === 'command' ? 'command' : 'agent'
   if (kind === 'agent' && (body?.prompt ?? '').trim() === '') throw new ApiError(400, 'prompt is required for agent jobs')
   if (kind === 'command' && (body?.command ?? '').trim() === '') throw new ApiError(400, 'command is required for command jobs')
   const now = Date.now()
-  const job = createJob({ ...(body as NewJobInput), kind, cron, title }, now, crypto.randomUUID())
+  const input: NewJobInput = { ...(body as NewJobInput), kind, cron, title }
+  if (!inbox) delete input.inbox
+  const job = createJob(input, now, crypto.randomUUID())
   const scheduled = job.schedule !== undefined && job.schedule.enabled
     ? withSchedule(job, {
         nextRunAt: interval !== undefined ? now + interval * 60_000 : nextRunAtMs(job.schedule.cron, now),
@@ -232,10 +273,24 @@ async function patch(response: ServerResponse, store: JobStore, id: string, body
     if (typeof body.command === 'string') job = { ...job, command: body.command.trim() }
     if (typeof body.args === 'string') job = { ...job, args: body.args.trim() }
     if (typeof body.workdir === 'string') job = { ...job, workdir: body.workdir.trim() || undefined }
+    if (typeof body.tool === 'string') {
+      const tool = body.tool.trim() || undefined
+      job = { ...job, tool, ...(tool !== undefined && body.cli === undefined ? { cli: undefined } : {}) }
+    }
     if (typeof body.session === 'string') job = { ...job, session: body.session.trim() || undefined }
     if (typeof body.timeoutMs === 'number') job = { ...job, timeoutMs: body.timeoutMs > 0 ? Math.round(body.timeoutMs) : undefined }
     if (typeof body.model === 'string') job = { ...job, model: body.model.trim() || undefined }
     if (typeof body.effort === 'string') job = { ...job, effort: body.effort.trim() || undefined }
+    if (typeof body.priority === 'number') job = { ...job, priority: normalizePriority(body.priority) }
+    if (typeof body.difficulty === 'number') job = { ...job, difficulty: normalizeDifficulty(body.difficulty) }
+    if (typeof body.targetProject === 'string') job = { ...job, targetProject: body.targetProject.trim() || undefined }
+    if (typeof body.inbox === 'boolean') {
+      if (body.inbox) job = { ...job, inbox: true }
+      else {
+        const { inbox: _dropped, ...rest } = job
+        job = rest
+      }
+    }
     if (typeof body.intervalMinutes === 'number') {
       // > 0 → fixed-interval mode (cron cleared); <= 0 → back to cron mode.
       job = withSchedule(job, { intervalMinutes: body.intervalMinutes > 0 ? Math.round(body.intervalMinutes) : undefined }, now)
@@ -249,12 +304,17 @@ async function patch(response: ServerResponse, store: JobStore, id: string, body
     }
     if (body.cli !== undefined && typeof body.cli === 'object' && body.cli !== null) {
       const profile = body.cli as Record<string, unknown>
+      const command = typeof profile.command === 'string' && profile.command.trim() ? profile.command.trim() : ''
+      const args = typeof profile.args === 'string' && profile.args.trim() ? profile.args.trim() : ''
+      // An all-empty override clears the field instead of pinning an empty profile.
       job = {
         ...job,
-        cli: {
-          ...(typeof profile.command === 'string' && profile.command.trim() ? { command: profile.command.trim() } : {}),
-          ...(typeof profile.args === 'string' && profile.args.trim() ? { args: profile.args.trim() } : {}),
-        },
+        cli: command === '' && args === ''
+          ? undefined
+          : {
+              ...(command !== '' ? { command } : {}),
+              ...(args !== '' ? { args } : {}),
+            },
       }
     }
     const cron = checkCron(body.cron)

@@ -11,6 +11,7 @@
 import { intervalNextMs, isIntervalRule, isSchedulable, nextRunAtMs, scheduleNextMs } from '../shared/schedule.js';
 import { settleExecution, startExecution, trimExecutions, withRunRequest } from '../shared/jobs.js';
 import { runJob } from './runner.js';
+import { loadDispatchPolicy, nextInboxCandidate, routedWorkdir } from './dispatch.js';
 /** Jobs with an execution in flight in this process (double-fire guard). */
 const inFlight = new Set();
 /**
@@ -54,6 +55,7 @@ function advanceSchedule(job, firedAt, now) {
  * (their results settle asynchronously).
  */
 export async function tick(store, profile, now = Date.now()) {
+    const policy = await loadDispatchPolicy();
     const dueJobs = await store.mutate(jobs => {
         let changed = false;
         const next = [];
@@ -116,6 +118,32 @@ export async function tick(store, profile, now = Date.now()) {
             fired.push({ job: current, executionId: opened.execution.id, trigger: 'scheduled', scheduledFor: firedAt });
             changed = true;
             next.push(current);
+        }
+        // Inbox auto-dispatch: fill idle capacity (the "timer-Agent" deciding
+        // what to work on next when nothing else is running). A candidate that is
+        // also due on a schedule has already been started above, so it no longer
+        // satisfies `status === 'idle'` and is skipped here. Routing to a
+        // `targetProject` happens at dispatch, overriding the job's `workdir`.
+        if (policy.enabled) {
+            const running = next.filter(item => item.status === 'running').length;
+            let capacity = Math.max(0, policy.maxConcurrent - running);
+            while (capacity > 0) {
+                const candidate = nextInboxCandidate(next, policy, now);
+                if (candidate === undefined)
+                    break;
+                const executionWorkdir = routedWorkdir(candidate);
+                const routed = executionWorkdir !== undefined ? { ...candidate, workdir: executionWorkdir } : candidate;
+                const opened = startExecution(routed, now, crypto.randomUUID(), 'dispatch');
+                const dispatched = trimExecutions(opened.job);
+                const index = next.findIndex(item => item.id === dispatched.id);
+                if (index !== -1)
+                    next[index] = dispatched;
+                else
+                    next.push(dispatched);
+                fired.push({ job: dispatched, executionId: opened.execution.id, trigger: 'dispatch', scheduledFor: now });
+                changed = true;
+                capacity -= 1;
+            }
         }
         if (!changed && fired.length === 0)
             return undefined;

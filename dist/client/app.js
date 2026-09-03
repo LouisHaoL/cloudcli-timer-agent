@@ -1,4 +1,5 @@
 import { commandLine, jobKind } from '../shared/jobs.js';
+import { AGENT_TOOLS, resolveAgentTool } from '../shared/agents.js';
 import { isValidCron, scheduleNextMs } from '../shared/schedule.js';
 import { createApi } from './api.js';
 /** Cron presets the create/edit form offers (each generates an expression). */
@@ -20,7 +21,7 @@ const RESULT_LABEL = {
     succeeded: '成功', failed: '失败', cancelled: '取消',
 };
 const TRIGGER_LABEL = {
-    scheduled: '定时', manual: '手动', retry: '重试',
+    scheduled: '定时', manual: '手动', dispatch: '派发', retry: '重试',
 };
 function formatTime(ms) {
     if (ms === undefined)
@@ -58,6 +59,8 @@ export class TimerAgentApp {
     host;
     jobs = [];
     targets = [];
+    toolModels;
+    dispatch;
     query = '';
     statusFilter = 'all';
     selectedId;
@@ -85,7 +88,9 @@ export class TimerAgentApp {
     }
     async refresh() {
         try {
-            this.jobs = await this.api.list();
+            const [jobs, dispatch] = await Promise.all([this.api.list(), this.api.dispatch()]);
+            this.jobs = jobs;
+            this.dispatch = dispatch;
         }
         catch (error) {
             this.jobs = [];
@@ -117,6 +122,7 @@ export class TimerAgentApp {
             const schedule = job.schedule;
             return `<tr data-id="${job.id}">
         <td><span class="ta-kind ta-kind-${kind}">${kind === 'command' ? '命令' : 'Agent'}</span>
+            ${job.inbox ? `<span class="ta-kind ta-kind-inbox">收件箱</span><span class="ta-muted">P${escapeHtml(String(job.priority ?? 3))}·D${escapeHtml(String(job.difficulty ?? 3))}</span>` : ''}
             <strong>${escapeHtml(job.title)}</strong></td>
         <td><span class="ta-status ta-status-${STATUS_CLASS[job.status]}">${STATUS_LABEL[job.status]}</span></td>
         <td><code>${escapeHtml(scheduleLabel(schedule))}</code>${schedule && !schedule.enabled ? ' <span class="ta-muted">(暂停)</span>' : ''}</td>
@@ -133,7 +139,14 @@ export class TimerAgentApp {
         const filterOptions = Object.entries(STATUS_LABEL)
             .map(([value, label]) => `<option value="${value}" ${this.statusFilter === value ? 'selected' : ''}>${label}</option>`)
             .join('');
+        const dispatch = this.dispatch;
         this.container.innerHTML = `
+      ${dispatch ? `<div class="ta-dispatch">
+        <span class="ta-dispatch-title">自动派发</span>
+        <span class="ta-status ${dispatch.policy.enabled ? 'ta-status-running' : 'ta-status-idle'}">${dispatch.policy.enabled ? '已开启' : '已暂停'}</span>
+        <span class="ta-muted">运行中 ${dispatch.status.running} · 队列 ${dispatch.status.queued}</span>
+        ${dispatch.status.next === null ? '' : `<span class="ta-muted">下一个:${escapeHtml(dispatch.status.next.title)}(${dispatch.status.next.score}分)</span>`}
+      </div>` : ''}
       <div class="ta-header">
         <h2>定时任务</h2>
         <select class="ta-status-filter" title="按状态筛选">
@@ -204,13 +217,19 @@ export class TimerAgentApp {
         }
     }
     /* ---------------- create / edit form ---------------- */
-    /** Fetch workspace/session groups (degrading to the last good set). */
+    /** Fetch workspace/session groups + host model lists (degrading to the last good set). */
     async loadTargets() {
         try {
             this.targets = await this.api.targets();
         }
         catch {
             // keep the previous list
+        }
+        try {
+            this.toolModels = await this.api.models();
+        }
+        catch {
+            // keep the previous list (undefined → picker uses the built-in catalog)
         }
         return this.targets;
     }
@@ -242,7 +261,7 @@ export class TimerAgentApp {
         rows.push(`<option value="custom">其他(手动输入路径)…</option>`);
         return rows.join('');
     }
-    /** Session options for one workdir: 新会话打开 first, pinned sessions after. */
+    /** Session options for one workdir: newest first, searchable via the combo. */
     sessionOptions(workdir, job) {
         const key = workdir === '' ? '' : TimerAgentApp.normPath(workdir);
         const project = this.host.context.project;
@@ -251,14 +270,112 @@ export class TimerAgentApp {
                 ? { name: project.name, workdir: project.path, sessions: [] }
                 : undefined);
         const pinned = job?.session ?? '';
-        const rows = [`<option value="">新会话打开</option>`];
-        for (const session of group?.sessions ?? []) {
-            const selected = pinned !== '' && session.id === pinned ? ' selected' : '';
-            rows.push(`<option value="${escapeHtml(session.id)}" title="${escapeHtml(session.id)}"${selected}>${escapeHtml(session.title)}(${formatTime(session.updatedAt)})</option>`);
+        const rows = (group?.sessions ?? []).map(session => ({
+            value: session.id,
+            label: session.title,
+            hint: formatTime(session.updatedAt),
+        }));
+        if (pinned !== '' && !rows.some(row => row.value === pinned)) {
+            rows.push({ value: pinned, label: `当前会话:${pinned}` });
         }
-        if (pinned !== '' && !(group?.sessions ?? []).some(session => session.id === pinned)) {
-            rows.push(`<option value="${escapeHtml(pinned)}" selected title="${escapeHtml(pinned)}">当前会话:${escapeHtml(pinned)}</option>`);
+        return rows;
+    }
+    /**
+     * Model options: the host's predefined lists (same source the host's own
+     * selector renders; the default is badged), falling back to the built-in
+     * catalog per tool. Grouped by tool so a pick links the tool select.
+     */
+    modelOptions() {
+        return AGENT_TOOLS.flatMap(tool => {
+            const entry = this.toolModels?.[tool.id];
+            const options = entry?.options ?? tool.models.map(model => ({ value: model, label: model }));
+            return options.map(option => ({
+                value: option.value,
+                label: option.label,
+                hint: `${tool.label}${option.value === entry?.default ? ' · 默认' : ''}${option.custom === true ? ' · 自定义' : ''}`,
+                group: tool.id,
+            }));
+        });
+    }
+    /**
+     * Mount a filterable combobox into `host` (a .ta-combo placeholder):
+     * text input filters the menu, picking an option pins the hidden field,
+     * and free-typed text is taken as the value as-is (custom model / raw
+     * session id).
+     */
+    mountCombo(host, name, options, current, placeholder, onPick) {
+        const display = current !== '' ? options.find(option => option.value === current)?.label ?? current : '';
+        host.innerHTML = `
+      <input class="ta-combo-display" type="text" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(display)}" autocomplete="off">
+      <input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(current)}">
+      <div class="ta-combo-menu" hidden></div>`;
+        const input = host.querySelector('.ta-combo-display');
+        const hidden = host.querySelector('input[type="hidden"]');
+        const menu = host.querySelector('.ta-combo-menu');
+        const openMenu = () => {
+            const query = input.value.trim().toLowerCase();
+            const visible = query === ''
+                ? options
+                : options.filter(option => `${option.label} ${option.value} ${option.hint ?? ''}`.toLowerCase().includes(query));
+            const rows = [];
+            let lastGroup;
+            for (const option of visible) {
+                if (option.group !== undefined && option.group !== lastGroup) {
+                    rows.push(`<div class="ta-combo-group">${escapeHtml(option.group)}</div>`);
+                    lastGroup = option.group;
+                }
+                rows.push(`<div class="ta-combo-item" data-value="${escapeHtml(option.value)}" title="${escapeHtml(option.value)}">
+          <span>${escapeHtml(option.label)}</span>${option.hint ? `<span class="ta-combo-hint">${escapeHtml(option.hint)}</span>` : ''}
+        </div>`);
+            }
+            menu.innerHTML = rows.join('') || '<div class="ta-combo-empty">无匹配,回车/保存即用输入值</div>';
+            menu.hidden = false;
+        };
+        const closeMenu = () => { menu.hidden = true; };
+        input.addEventListener('focus', openMenu);
+        input.addEventListener('input', () => {
+            hidden.value = input.value;
+            openMenu();
+        });
+        // mousedown (not click) so the pick lands before the input's blur.
+        menu.addEventListener('mousedown', event => {
+            event.preventDefault();
+            const item = event.target.closest('.ta-combo-item');
+            if (item === null)
+                return;
+            const option = options.find(candidate => candidate.value === item.dataset.value);
+            if (option === undefined)
+                return;
+            input.value = option.label;
+            hidden.value = option.value;
+            closeMenu();
+            onPick?.(option);
+        });
+        input.addEventListener('blur', closeMenu);
+        input.addEventListener('keydown', event => {
+            if (event.key === 'Escape')
+                closeMenu();
+        });
+    }
+    /** Target-project options for inbox dispatch routing (matches `targetProject`). */
+    targetProjectOptions(job) {
+        const project = this.host.context.project;
+        const target = job?.targetProject ?? '';
+        const groups = [...this.targets];
+        if (project !== null && !groups.some(group => TimerAgentApp.normPath(group.workdir) === TimerAgentApp.normPath(project.path))) {
+            groups.unshift({ name: `${project.name}(当前)`, workdir: project.path, sessions: [] });
         }
+        const matched = target !== '' &&
+            groups.some(group => TimerAgentApp.normPath(group.workdir) === TimerAgentApp.normPath(target));
+        const rows = [`<option value="">默认(任务自身项目)</option>`];
+        for (const [index, group] of groups.entries()) {
+            const selected = target !== '' && TimerAgentApp.normPath(group.workdir) === TimerAgentApp.normPath(target);
+            rows.push(`<option value="g${index}" data-workdir="${escapeHtml(group.workdir)}" ${selected ? 'selected' : ''}>${escapeHtml(group.name)}</option>`);
+        }
+        if (target !== '' && !matched) {
+            rows.push(`<option value="g-custom" data-workdir="${escapeHtml(target)}" selected>${escapeHtml(pathBasename(target))}(手动)</option>`);
+        }
+        rows.push(`<option value="custom">其他(手动输入路径)…</option>`);
         return rows.join('');
     }
     renderForm() {
@@ -274,6 +391,18 @@ export class TimerAgentApp {
         const intervalValue = val('intervalMin', iv === undefined ? ''
             : String(intervalUnit === '1440' ? iv / 1440 : intervalUnit === '60' ? iv / 60 : iv));
         const presetOptions = CRON_PRESETS.map(preset => `<option value="${preset.cron}" ${preset.cron === cron ? 'selected' : ''}>${preset.label}</option>`).join('');
+        const inboxOn = draft !== undefined ? draft.inbox === 'on' : job?.inbox === true;
+        const toolVal = val('tool', job?.tool ?? 'claude');
+        const priority = Number(val('priority', String(job?.priority ?? 3)));
+        const difficulty = Number(val('difficulty', String(job?.difficulty ?? 3)));
+        const priorityOptions = [1, 2, 3, 4, 5]
+            .map(value => `<option value="${value}" ${priority === value ? 'selected' : ''}>${value}${value === 1 ? '(低)' : value === 5 ? '(高)' : ''}</option>`).join('');
+        const difficultyOptions = [1, 2, 3, 4, 5]
+            .map(value => `<option value="${value}" ${difficulty === value ? 'selected' : ''}>${value}${value === 1 ? '(易)' : value === 5 ? '(难)' : ''}</option>`).join('');
+        const toolOptions = [
+            ...AGENT_TOOLS.map(tool => `<option value="${tool.id}" ${toolVal === tool.id ? 'selected' : ''}>${tool.label}</option>`),
+            `<option value="custom" ${toolVal === 'custom' ? 'selected' : ''}>自定义 CLI</option>`,
+        ].join('');
         this.container.innerHTML = `
       <div class="ta-header"><h2>${job ? '编辑任务' : '新建任务'}</h2>
         <button class="ta-btn" data-act="cancel">返回</button></div>
@@ -283,6 +412,13 @@ export class TimerAgentApp {
           <option value="agent" ${kind === 'agent' ? 'selected' : ''}>AI Agent 任务(执行 prompt)</option>
           <option value="command" ${kind === 'command' ? 'selected' : ''}>普通任务(直接运行命令)</option>
         </select></label>
+        <label class="ta-inline"><input name="inbox" type="checkbox" ${inboxOn ? 'checked' : ''}> 收件箱(空闲时自动派发)</label>
+        <div class="ta-field-dispatch${inboxOn ? ' ta-field-dispatch-on' : ''}">
+          <label>优先级<select name="priority">${priorityOptions}</select></label>
+          <label>难度<select name="difficulty">${difficultyOptions}</select></label>
+          <label>执行项目(派发时路由)<select name="targetWs2">${this.targetProjectOptions(job)}</select></label>
+          <label class="ta-field-custom-target" hidden>目标项目路径<input name="targetProject" value="${escapeHtml(val('targetProject', job?.targetProject ?? ''))}"></label>
+        </div>
         <label class="ta-field-prompt" ${kind === 'command' ? 'hidden' : ''}>Prompt(无人在场,必须自包含)<textarea name="prompt" rows="5">${escapeHtml(val('prompt', job?.prompt ?? ''))}</textarea></label>
         <div class="ta-field-command" ${kind === 'command' ? '' : 'hidden'}>
           <label>命令(建议绝对路径)<input name="command" value="${escapeHtml(val('command', job?.command ?? ''))}"></label>
@@ -291,13 +427,18 @@ export class TimerAgentApp {
         <label>描述<input name="description" value="${escapeHtml(val('description', job?.description ?? ''))}"></label>
         <div class="ta-field-target" ${kind === 'command' ? 'hidden' : ''}>
           <label>工作空间<select name="targetWs">${this.workspaceOptions(job)}</select></label>
-          <label>会话<select name="targetSession">${this.sessionOptions(job?.workdir ?? '', job)}</select></label>
+          <label>会话(按最近更新排序,可搜索/输入 id)<div class="ta-combo" data-combo="session"></div></label>
           <label class="ta-field-custom-ws" hidden>工作目录<input name="customWorkdir" value="${escapeHtml(val('customWorkdir', ''))}"></label>
         </div>
         <label class="ta-field-workdir" ${kind === 'agent' ? 'hidden' : ''}>工作目录(留空 = 服务默认)<input name="workdir" value="${escapeHtml(val('workdir', job?.workdir ?? ''))}"></label>
         <div class="ta-field-model" ${kind === 'agent' ? '' : 'hidden'}>
-          <label>模型(留空 = 默认 glm-5.3-flash)<input name="model" value="${escapeHtml(val('model', job?.model ?? ''))}" placeholder="glm-5.3-flash"></label>
-          <label>思考等级(留空 = 默认 medium)<input name="effort" value="${escapeHtml(val('effort', job?.effort ?? ''))}" placeholder="medium"></label>
+          <label>工具<select name="tool">${toolOptions}</select></label>
+          <div class="ta-field-custom-cli" ${toolVal === 'custom' ? '' : 'hidden'}>
+            <label>CLI 命令(建议绝对路径)<input name="cliCommand" value="${escapeHtml(val('cliCommand', job?.cli?.command ?? ''))}" placeholder="D:\\env\\nodejs\\node.exe"></label>
+            <label>CLI 参数(模板,无 {{prompt}} 时走 stdin)<input name="cliArgs" value="${escapeHtml(val('cliArgs', job?.cli?.args ?? ''))}" placeholder="--print"></label>
+          </div>
+          <label>模型(可搜索/可输入,选中后自动切到对应工具)<div class="ta-combo" data-combo="model"></div></label>
+          <label>思考等级(claude=--effort / codex=model_reasoning_effort / opencode=--variant,留空 = 默认 medium)<input name="effort" value="${escapeHtml(val('effort', job?.effort ?? ''))}" placeholder="medium"></label>
         </div>
         <label class="ta-inline"><input name="enabled" type="checkbox" ${schedEnabled ? 'checked' : ''}> 启用调度(关闭后任务只保留手动执行)</label>
         <div class="ta-field-sched${schedEnabled ? '' : ' ta-disabled'}">
@@ -329,10 +470,20 @@ export class TimerAgentApp {
             const syncSched = () => { schedBox.classList.toggle('ta-disabled', !enabledBox.checked); };
             enabledBox.addEventListener('change', syncSched);
         }
+        // 收件箱开关:勾选时才显示优先级/难度/执行项目选择。
+        const dispatchBox = this.container.querySelector('.ta-field-dispatch');
+        const inboxBox = form.querySelector('[name="inbox"]');
+        if (dispatchBox !== null && inboxBox !== null) {
+            const syncInbox = () => {
+                dispatchBox.classList.toggle('ta-field-dispatch-on', inboxBox.checked);
+                dispatchBox.classList.toggle('ta-disabled', !inboxBox.checked);
+            };
+            inboxBox.addEventListener('change', syncInbox);
+        }
         form.querySelector('[name="kind"]').addEventListener('change', event => {
             // Keep everything already typed; only the visible field set changes.
             const data = new FormData(form);
-            const preserve = ['title', 'description', 'prompt', 'command', 'args', 'workdir', 'customWorkdir', 'cron', 'intervalMin', 'intervalUnit', 'timeoutMin', 'model', 'effort', 'enabled'];
+            const preserve = ['title', 'description', 'prompt', 'command', 'args', 'workdir', 'customWorkdir', 'cron', 'intervalMin', 'intervalUnit', 'timeoutMin', 'model', 'effort', 'tool', 'cliCommand', 'cliArgs', 'enabled', 'inbox', 'priority', 'difficulty', 'targetWs2', 'targetProject'];
             this.formDraft = Object.fromEntries(preserve.map(name => [name, String(data.get(name) ?? '')]));
             this.formKind = event.target.value === 'command' ? 'command' : 'agent';
             this.renderForm();
@@ -344,16 +495,48 @@ export class TimerAgentApp {
                 cronInput.value = value;
             }
         });
+        // 工具选择:custom 时才显示手动 CLI 命令/参数。
+        const toolSelect = form.querySelector('[name="tool"]');
+        const syncCustomCli = () => {
+            const cliBox = this.container.querySelector('.ta-field-custom-cli');
+            if (cliBox !== null)
+                cliBox.hidden = toolSelect?.value !== 'custom';
+        };
+        toolSelect?.addEventListener('change', syncCustomCli);
+        // 模型 combobox:选中目录里的模型时联动切到对应工具。
+        const modelHost = this.container.querySelector('.ta-combo[data-combo="model"]');
+        if (modelHost !== null) {
+            this.mountCombo(modelHost, 'model', this.modelOptions(), val('model', job?.model ?? ''), '留空 = CLI 自身默认(claude 走服务端配置)', option => {
+                if (option.group !== undefined && toolSelect !== null) {
+                    toolSelect.value = option.group;
+                    syncCustomCli();
+                }
+            });
+        }
+        // 会话 combobox:跟随工作空间选择重建(保留已输入的值)。
+        const mountSessionCombo = () => {
+            const select = form.querySelector('[name="targetWs"]');
+            const workdir = select === null || select.value === '' || select.value === 'custom'
+                ? ''
+                : select.selectedOptions[0]?.dataset.workdir ?? '';
+            const sessionHost = this.container.querySelector('.ta-combo[data-combo="session"]');
+            if (sessionHost !== null) {
+                this.mountCombo(sessionHost, 'targetSession', this.sessionOptions(workdir, job), val('targetSession', job?.session ?? ''), '新会话打开(留空),或搜索/输入会话 id', undefined);
+            }
+        };
+        mountSessionCombo();
         // Workspace pick drives the session list (and the manual-path input).
         form.querySelector('[name="targetWs"]')?.addEventListener('change', event => {
             const select = event.target;
-            const workdir = select.value === '' || select.value === 'custom'
-                ? ''
-                : select.selectedOptions[0]?.dataset.workdir ?? '';
-            const sessionSelect = form.querySelector('[name="targetSession"]');
-            if (sessionSelect !== null)
-                sessionSelect.innerHTML = this.sessionOptions(workdir, job);
+            mountSessionCombo();
             const custom = form.querySelector('.ta-field-custom-ws');
+            if (custom !== null)
+                custom.hidden = select.value !== 'custom';
+        });
+        // 执行项目选择:custom 时显示手填目标项目路径。
+        form.querySelector('[name="targetWs2"]')?.addEventListener('change', event => {
+            const select = event.target;
+            const custom = form.querySelector('.ta-field-custom-target');
             if (custom !== null)
                 custom.hidden = select.value !== 'custom';
         });
@@ -372,16 +555,26 @@ export class TimerAgentApp {
         const kind = data.get('kind') === 'command' ? 'command' : 'agent';
         const cron = String(data.get('cron') ?? '').trim();
         const enabled = data.get('enabled') === 'on';
+        const inbox = data.get('inbox') === 'on';
         const intervalMin = Number(data.get('intervalMin'));
         const unitMin = Number(data.get('intervalUnit') ?? 1) || 1;
         const intervalMinutes = Number.isFinite(intervalMin) && intervalMin > 0 && unitMin > 0
             ? Math.round(intervalMin * unitMin)
             : undefined;
-        if (intervalMinutes === undefined && !isValidCron(cron)) {
+        if (!inbox && intervalMinutes === undefined && !isValidCron(cron)) {
             window.alert('需要填写有效的 cron 表达式,或固定间隔数值');
             return;
         }
         const timeoutMin = Number(data.get('timeoutMin'));
+        const priority = Number(data.get('priority'));
+        const difficulty = Number(data.get('difficulty'));
+        const targetWs2 = this.container.querySelector('[name="targetWs2"]');
+        const targetValue = targetWs2?.value ?? '';
+        const targetProject = targetValue === ''
+            ? ''
+            : targetValue === 'custom'
+                ? String(data.get('targetProject') ?? '')
+                : targetWs2?.selectedOptions[0]?.dataset.workdir ?? '';
         // Agent jobs: workdir/session come from the pickers; commands keep the text input.
         let workdir = String(data.get('workdir') ?? '');
         let session = '';
@@ -402,9 +595,23 @@ export class TimerAgentApp {
             workdir,
             cron: intervalMinutes !== undefined ? '' : cron,
             enabled,
+            inbox,
+            ...(inbox ? {
+                priority: Number.isFinite(priority) ? priority : 3,
+                difficulty: Number.isFinite(difficulty) ? difficulty : 3,
+                targetProject,
+            } : {}),
             ...(kind === 'agent' ? {
                 prompt: String(data.get('prompt') ?? ''),
                 session,
+                // 'custom' → 手动 CLI 档(tool 留空,走 cli 覆盖);其余为目录里的工具 id。
+                tool: (() => {
+                    const raw = String(data.get('tool') ?? '');
+                    return raw === 'custom' ? undefined : raw;
+                })(),
+                cli: data.get('tool') === 'custom'
+                    ? { command: String(data.get('cliCommand') ?? ''), args: String(data.get('cliArgs') ?? '') }
+                    : undefined,
                 model: String(data.get('model') ?? '').trim(),
                 effort: String(data.get('effort') ?? '').trim(),
             } : {}),
@@ -450,8 +657,15 @@ export class TimerAgentApp {
             ${schedule.lastTriggeredAt !== undefined ? `<span class="ta-muted">上次:</span>${formatTime(schedule.lastTriggeredAt)} · ` : ''}下次:<strong>${formatTime(schedule.nextRunAt)}</strong>` : '未配置调度'}
           ${job.workdir ? ` · 目录:<code>${escapeHtml(job.workdir)}</code>` : ''}
           ${job.session ? ` · 会话:<code>${escapeHtml(job.session)}</code>` : ''}
-          ${kind === 'agent' ? ` · 模型:<code>${escapeHtml(job.model || 'glm-5.3-flash(默认)')}</code>/<code>${escapeHtml(job.effort || 'medium(默认)')}</code>` : ''}
+          ${kind === 'agent' ? ` · 工具:<code>${escapeHtml(resolveAgentTool(job.tool)?.label ?? (job.cli?.command ? '自定义' : 'Claude(服务端默认)'))}</code> · 模型:<code>${escapeHtml(job.model || 'glm-5.3-flash(默认)')}</code>/<code>${escapeHtml(job.effort || 'medium(默认)')}</code>` : ''}
         </div>
+        ${job.inbox ? `<div class="ta-dispatch-meta">
+          <span class="ta-kind ta-kind-inbox">收件箱</span>
+          <span>优先级:<strong>${job.priority ?? 3}</strong>/5</span>
+          <span>难度:<strong>${job.difficulty ?? 3}</strong>/5</span>
+          ${job.targetProject ? `<span>派发目录:<code>${escapeHtml(job.targetProject)}</code></span>` : ''}
+          <span class="ta-muted">空闲时按最高分自动派发</span>
+        </div>` : ''}
         <div class="ta-actions ta-row">
           <button class="ta-btn ta-primary" data-act="run">立即执行</button>
           <button class="ta-btn" data-act="edit">编辑</button>

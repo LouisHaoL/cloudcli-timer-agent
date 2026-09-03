@@ -7,6 +7,54 @@ function commandLine(job) {
   return `${job.command ?? ""} ${job.args ?? ""}`.trim();
 }
 
+// src/shared/agents.ts
+var AGENT_TOOLS = [
+  {
+    id: "claude",
+    label: "Claude",
+    command: "claude",
+    args: "--print --permission-mode bypassPermissions",
+    modelFlag: "--model",
+    effortStyle: "flag",
+    sessionFlag: "--resume",
+    inheritServerModel: true,
+    models: [
+      "glm-5.3-flash",
+      "glm-5.3",
+      "glm-4.7",
+      "glm-4.6",
+      "claude-opus-5",
+      "claude-sonnet-5",
+      "claude-haiku-4-5"
+    ]
+  },
+  {
+    id: "codex",
+    label: "Codex",
+    command: "codex",
+    args: "exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox",
+    modelFlag: "--model",
+    effortStyle: "config",
+    resumeSubcommand: "resume",
+    models: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4"]
+  },
+  {
+    id: "opencode",
+    label: "OpenCode",
+    command: "opencode",
+    args: "run --auto",
+    modelFlag: "--model",
+    effortStyle: "variant",
+    sessionFlag: "--session",
+    models: ["anthropic/claude-sonnet-4-5", "openai/gpt-5.4"]
+  }
+];
+function resolveAgentTool(id) {
+  const key = id?.trim();
+  if (key === void 0 || key === "") return void 0;
+  return AGENT_TOOLS.find((tool) => tool.id === key);
+}
+
 // src/shared/schedule.ts
 var FIELD_RANGES = [
   [0, 59],
@@ -115,12 +163,15 @@ function createApi(api) {
   return {
     list: () => call("GET", "/v1/jobs").then((body) => body.jobs),
     targets: () => call("GET", "/v1/targets").then((body) => body.groups),
+    models: () => call("GET", "/v1/models").then((body) => body.models),
     create: (input) => call("POST", "/v1/jobs", input).then((body) => body.job),
     patch: (id, body) => call("PATCH", `/v1/jobs/${encodeURIComponent(id)}`, body).then((body2) => body2.job),
     remove: (id) => call("DELETE", `/v1/jobs/${encodeURIComponent(id)}`),
     action: (id, action) => action === "run-now" ? call("POST", `/v1/jobs/${encodeURIComponent(id)}/actions/run-now`) : call("POST", `/v1/jobs/${encodeURIComponent(id)}/actions/${action}`).then((body) => body.job),
     profile: () => call("GET", "/v1/profile").then((body) => body.profile),
-    setProfile: (profile) => call("PUT", "/v1/profile", profile).then((body) => body.profile)
+    setProfile: (profile) => call("PUT", "/v1/profile", profile).then((body) => body.profile),
+    dispatch: () => call("GET", "/v1/dispatch"),
+    setDispatch: (policy) => call("PUT", "/v1/dispatch", policy).then((body) => body.policy)
   };
 }
 
@@ -155,6 +206,7 @@ var RESULT_LABEL = {
 var TRIGGER_LABEL = {
   scheduled: "\u5B9A\u65F6",
   manual: "\u624B\u52A8",
+  dispatch: "\u6D3E\u53D1",
   retry: "\u91CD\u8BD5"
 };
 function formatTime(ms) {
@@ -190,6 +242,8 @@ var TimerAgentApp = class _TimerAgentApp {
   host;
   jobs = [];
   targets = [];
+  toolModels;
+  dispatch;
   query = "";
   statusFilter = "all";
   selectedId;
@@ -211,7 +265,9 @@ var TimerAgentApp = class _TimerAgentApp {
   }
   async refresh() {
     try {
-      this.jobs = await this.api.list();
+      const [jobs, dispatch] = await Promise.all([this.api.list(), this.api.dispatch()]);
+      this.jobs = jobs;
+      this.dispatch = dispatch;
     } catch (error) {
       this.jobs = [];
       this.container.innerHTML = `<div class="ta-error">\u8C03\u5EA6\u670D\u52A1\u4E0D\u53EF\u8FBE:${escapeHtml(String(error))}</div>`;
@@ -234,6 +290,7 @@ var TimerAgentApp = class _TimerAgentApp {
       const schedule = job.schedule;
       return `<tr data-id="${job.id}">
         <td><span class="ta-kind ta-kind-${kind}">${kind === "command" ? "\u547D\u4EE4" : "Agent"}</span>
+            ${job.inbox ? `<span class="ta-kind ta-kind-inbox">\u6536\u4EF6\u7BB1</span><span class="ta-muted">P${escapeHtml(String(job.priority ?? 3))}\xB7D${escapeHtml(String(job.difficulty ?? 3))}</span>` : ""}
             <strong>${escapeHtml(job.title)}</strong></td>
         <td><span class="ta-status ta-status-${STATUS_CLASS[job.status]}">${STATUS_LABEL[job.status]}</span></td>
         <td><code>${escapeHtml(scheduleLabel(schedule))}</code>${schedule && !schedule.enabled ? ' <span class="ta-muted">(\u6682\u505C)</span>' : ""}</td>
@@ -248,7 +305,14 @@ var TimerAgentApp = class _TimerAgentApp {
       </tr>`;
     }).join("");
     const filterOptions = Object.entries(STATUS_LABEL).map(([value, label]) => `<option value="${value}" ${this.statusFilter === value ? "selected" : ""}>${label}</option>`).join("");
+    const dispatch = this.dispatch;
     this.container.innerHTML = `
+      ${dispatch ? `<div class="ta-dispatch">
+        <span class="ta-dispatch-title">\u81EA\u52A8\u6D3E\u53D1</span>
+        <span class="ta-status ${dispatch.policy.enabled ? "ta-status-running" : "ta-status-idle"}">${dispatch.policy.enabled ? "\u5DF2\u5F00\u542F" : "\u5DF2\u6682\u505C"}</span>
+        <span class="ta-muted">\u8FD0\u884C\u4E2D ${dispatch.status.running} \xB7 \u961F\u5217 ${dispatch.status.queued}</span>
+        ${dispatch.status.next === null ? "" : `<span class="ta-muted">\u4E0B\u4E00\u4E2A:${escapeHtml(dispatch.status.next.title)}(${dispatch.status.next.score}\u5206)</span>`}
+      </div>` : ""}
       <div class="ta-header">
         <h2>\u5B9A\u65F6\u4EFB\u52A1</h2>
         <select class="ta-status-filter" title="\u6309\u72B6\u6001\u7B5B\u9009">
@@ -311,10 +375,14 @@ var TimerAgentApp = class _TimerAgentApp {
     }
   }
   /* ---------------- create / edit form ---------------- */
-  /** Fetch workspace/session groups (degrading to the last good set). */
+  /** Fetch workspace/session groups + host model lists (degrading to the last good set). */
   async loadTargets() {
     try {
       this.targets = await this.api.targets();
+    } catch {
+    }
+    try {
+      this.toolModels = await this.api.models();
     } catch {
     }
     return this.targets;
@@ -345,20 +413,113 @@ var TimerAgentApp = class _TimerAgentApp {
     rows.push(`<option value="custom">\u5176\u4ED6(\u624B\u52A8\u8F93\u5165\u8DEF\u5F84)\u2026</option>`);
     return rows.join("");
   }
-  /** Session options for one workdir: 新会话打开 first, pinned sessions after. */
+  /** Session options for one workdir: newest first, searchable via the combo. */
   sessionOptions(workdir, job) {
     const key = workdir === "" ? "" : _TimerAgentApp.normPath(workdir);
     const project = this.host.context.project;
     const group = this.targets.find((candidate) => _TimerAgentApp.normPath(candidate.workdir) === key) ?? (project !== null && key !== "" && _TimerAgentApp.normPath(project.path) === key ? { name: project.name, workdir: project.path, sessions: [] } : void 0);
     const pinned = job?.session ?? "";
-    const rows = [`<option value="">\u65B0\u4F1A\u8BDD\u6253\u5F00</option>`];
-    for (const session of group?.sessions ?? []) {
-      const selected = pinned !== "" && session.id === pinned ? " selected" : "";
-      rows.push(`<option value="${escapeHtml(session.id)}" title="${escapeHtml(session.id)}"${selected}>${escapeHtml(session.title)}(${formatTime(session.updatedAt)})</option>`);
+    const rows = (group?.sessions ?? []).map((session) => ({
+      value: session.id,
+      label: session.title,
+      hint: formatTime(session.updatedAt)
+    }));
+    if (pinned !== "" && !rows.some((row) => row.value === pinned)) {
+      rows.push({ value: pinned, label: `\u5F53\u524D\u4F1A\u8BDD:${pinned}` });
     }
-    if (pinned !== "" && !(group?.sessions ?? []).some((session) => session.id === pinned)) {
-      rows.push(`<option value="${escapeHtml(pinned)}" selected title="${escapeHtml(pinned)}">\u5F53\u524D\u4F1A\u8BDD:${escapeHtml(pinned)}</option>`);
+    return rows;
+  }
+  /**
+   * Model options: the host's predefined lists (same source the host's own
+   * selector renders; the default is badged), falling back to the built-in
+   * catalog per tool. Grouped by tool so a pick links the tool select.
+   */
+  modelOptions() {
+    return AGENT_TOOLS.flatMap((tool) => {
+      const entry = this.toolModels?.[tool.id];
+      const options = entry?.options ?? tool.models.map((model) => ({ value: model, label: model }));
+      return options.map((option) => ({
+        value: option.value,
+        label: option.label,
+        hint: `${tool.label}${option.value === entry?.default ? " \xB7 \u9ED8\u8BA4" : ""}${option.custom === true ? " \xB7 \u81EA\u5B9A\u4E49" : ""}`,
+        group: tool.id
+      }));
+    });
+  }
+  /**
+   * Mount a filterable combobox into `host` (a .ta-combo placeholder):
+   * text input filters the menu, picking an option pins the hidden field,
+   * and free-typed text is taken as the value as-is (custom model / raw
+   * session id).
+   */
+  mountCombo(host, name, options, current, placeholder, onPick) {
+    const display = current !== "" ? options.find((option) => option.value === current)?.label ?? current : "";
+    host.innerHTML = `
+      <input class="ta-combo-display" type="text" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(display)}" autocomplete="off">
+      <input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(current)}">
+      <div class="ta-combo-menu" hidden></div>`;
+    const input = host.querySelector(".ta-combo-display");
+    const hidden = host.querySelector('input[type="hidden"]');
+    const menu = host.querySelector(".ta-combo-menu");
+    const openMenu = () => {
+      const query = input.value.trim().toLowerCase();
+      const visible = query === "" ? options : options.filter((option) => `${option.label} ${option.value} ${option.hint ?? ""}`.toLowerCase().includes(query));
+      const rows = [];
+      let lastGroup;
+      for (const option of visible) {
+        if (option.group !== void 0 && option.group !== lastGroup) {
+          rows.push(`<div class="ta-combo-group">${escapeHtml(option.group)}</div>`);
+          lastGroup = option.group;
+        }
+        rows.push(`<div class="ta-combo-item" data-value="${escapeHtml(option.value)}" title="${escapeHtml(option.value)}">
+          <span>${escapeHtml(option.label)}</span>${option.hint ? `<span class="ta-combo-hint">${escapeHtml(option.hint)}</span>` : ""}
+        </div>`);
+      }
+      menu.innerHTML = rows.join("") || '<div class="ta-combo-empty">\u65E0\u5339\u914D,\u56DE\u8F66/\u4FDD\u5B58\u5373\u7528\u8F93\u5165\u503C</div>';
+      menu.hidden = false;
+    };
+    const closeMenu = () => {
+      menu.hidden = true;
+    };
+    input.addEventListener("focus", openMenu);
+    input.addEventListener("input", () => {
+      hidden.value = input.value;
+      openMenu();
+    });
+    menu.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      const item = event.target.closest(".ta-combo-item");
+      if (item === null) return;
+      const option = options.find((candidate) => candidate.value === item.dataset.value);
+      if (option === void 0) return;
+      input.value = option.label;
+      hidden.value = option.value;
+      closeMenu();
+      onPick?.(option);
+    });
+    input.addEventListener("blur", closeMenu);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeMenu();
+    });
+  }
+  /** Target-project options for inbox dispatch routing (matches `targetProject`). */
+  targetProjectOptions(job) {
+    const project = this.host.context.project;
+    const target = job?.targetProject ?? "";
+    const groups = [...this.targets];
+    if (project !== null && !groups.some((group) => _TimerAgentApp.normPath(group.workdir) === _TimerAgentApp.normPath(project.path))) {
+      groups.unshift({ name: `${project.name}(\u5F53\u524D)`, workdir: project.path, sessions: [] });
     }
+    const matched = target !== "" && groups.some((group) => _TimerAgentApp.normPath(group.workdir) === _TimerAgentApp.normPath(target));
+    const rows = [`<option value="">\u9ED8\u8BA4(\u4EFB\u52A1\u81EA\u8EAB\u9879\u76EE)</option>`];
+    for (const [index, group] of groups.entries()) {
+      const selected = target !== "" && _TimerAgentApp.normPath(group.workdir) === _TimerAgentApp.normPath(target);
+      rows.push(`<option value="g${index}" data-workdir="${escapeHtml(group.workdir)}" ${selected ? "selected" : ""}>${escapeHtml(group.name)}</option>`);
+    }
+    if (target !== "" && !matched) {
+      rows.push(`<option value="g-custom" data-workdir="${escapeHtml(target)}" selected>${escapeHtml(pathBasename(target))}(\u624B\u52A8)</option>`);
+    }
+    rows.push(`<option value="custom">\u5176\u4ED6(\u624B\u52A8\u8F93\u5165\u8DEF\u5F84)\u2026</option>`);
     return rows.join("");
   }
   renderForm() {
@@ -372,6 +533,16 @@ var TimerAgentApp = class _TimerAgentApp {
     const intervalUnit = val("intervalUnit", iv === void 0 ? "1" : iv % 1440 === 0 ? "1440" : iv % 60 === 0 ? "60" : "1");
     const intervalValue = val("intervalMin", iv === void 0 ? "" : String(intervalUnit === "1440" ? iv / 1440 : intervalUnit === "60" ? iv / 60 : iv));
     const presetOptions = CRON_PRESETS.map((preset) => `<option value="${preset.cron}" ${preset.cron === cron ? "selected" : ""}>${preset.label}</option>`).join("");
+    const inboxOn = draft !== void 0 ? draft.inbox === "on" : job?.inbox === true;
+    const toolVal = val("tool", job?.tool ?? "claude");
+    const priority = Number(val("priority", String(job?.priority ?? 3)));
+    const difficulty = Number(val("difficulty", String(job?.difficulty ?? 3)));
+    const priorityOptions = [1, 2, 3, 4, 5].map((value) => `<option value="${value}" ${priority === value ? "selected" : ""}>${value}${value === 1 ? "(\u4F4E)" : value === 5 ? "(\u9AD8)" : ""}</option>`).join("");
+    const difficultyOptions = [1, 2, 3, 4, 5].map((value) => `<option value="${value}" ${difficulty === value ? "selected" : ""}>${value}${value === 1 ? "(\u6613)" : value === 5 ? "(\u96BE)" : ""}</option>`).join("");
+    const toolOptions = [
+      ...AGENT_TOOLS.map((tool) => `<option value="${tool.id}" ${toolVal === tool.id ? "selected" : ""}>${tool.label}</option>`),
+      `<option value="custom" ${toolVal === "custom" ? "selected" : ""}>\u81EA\u5B9A\u4E49 CLI</option>`
+    ].join("");
     this.container.innerHTML = `
       <div class="ta-header"><h2>${job ? "\u7F16\u8F91\u4EFB\u52A1" : "\u65B0\u5EFA\u4EFB\u52A1"}</h2>
         <button class="ta-btn" data-act="cancel">\u8FD4\u56DE</button></div>
@@ -381,6 +552,13 @@ var TimerAgentApp = class _TimerAgentApp {
           <option value="agent" ${kind === "agent" ? "selected" : ""}>AI Agent \u4EFB\u52A1(\u6267\u884C prompt)</option>
           <option value="command" ${kind === "command" ? "selected" : ""}>\u666E\u901A\u4EFB\u52A1(\u76F4\u63A5\u8FD0\u884C\u547D\u4EE4)</option>
         </select></label>
+        <label class="ta-inline"><input name="inbox" type="checkbox" ${inboxOn ? "checked" : ""}> \u6536\u4EF6\u7BB1(\u7A7A\u95F2\u65F6\u81EA\u52A8\u6D3E\u53D1)</label>
+        <div class="ta-field-dispatch${inboxOn ? " ta-field-dispatch-on" : ""}">
+          <label>\u4F18\u5148\u7EA7<select name="priority">${priorityOptions}</select></label>
+          <label>\u96BE\u5EA6<select name="difficulty">${difficultyOptions}</select></label>
+          <label>\u6267\u884C\u9879\u76EE(\u6D3E\u53D1\u65F6\u8DEF\u7531)<select name="targetWs2">${this.targetProjectOptions(job)}</select></label>
+          <label class="ta-field-custom-target" hidden>\u76EE\u6807\u9879\u76EE\u8DEF\u5F84<input name="targetProject" value="${escapeHtml(val("targetProject", job?.targetProject ?? ""))}"></label>
+        </div>
         <label class="ta-field-prompt" ${kind === "command" ? "hidden" : ""}>Prompt(\u65E0\u4EBA\u5728\u573A,\u5FC5\u987B\u81EA\u5305\u542B)<textarea name="prompt" rows="5">${escapeHtml(val("prompt", job?.prompt ?? ""))}</textarea></label>
         <div class="ta-field-command" ${kind === "command" ? "" : "hidden"}>
           <label>\u547D\u4EE4(\u5EFA\u8BAE\u7EDD\u5BF9\u8DEF\u5F84)<input name="command" value="${escapeHtml(val("command", job?.command ?? ""))}"></label>
@@ -389,13 +567,18 @@ var TimerAgentApp = class _TimerAgentApp {
         <label>\u63CF\u8FF0<input name="description" value="${escapeHtml(val("description", job?.description ?? ""))}"></label>
         <div class="ta-field-target" ${kind === "command" ? "hidden" : ""}>
           <label>\u5DE5\u4F5C\u7A7A\u95F4<select name="targetWs">${this.workspaceOptions(job)}</select></label>
-          <label>\u4F1A\u8BDD<select name="targetSession">${this.sessionOptions(job?.workdir ?? "", job)}</select></label>
+          <label>\u4F1A\u8BDD(\u6309\u6700\u8FD1\u66F4\u65B0\u6392\u5E8F,\u53EF\u641C\u7D22/\u8F93\u5165 id)<div class="ta-combo" data-combo="session"></div></label>
           <label class="ta-field-custom-ws" hidden>\u5DE5\u4F5C\u76EE\u5F55<input name="customWorkdir" value="${escapeHtml(val("customWorkdir", ""))}"></label>
         </div>
         <label class="ta-field-workdir" ${kind === "agent" ? "hidden" : ""}>\u5DE5\u4F5C\u76EE\u5F55(\u7559\u7A7A = \u670D\u52A1\u9ED8\u8BA4)<input name="workdir" value="${escapeHtml(val("workdir", job?.workdir ?? ""))}"></label>
         <div class="ta-field-model" ${kind === "agent" ? "" : "hidden"}>
-          <label>\u6A21\u578B(\u7559\u7A7A = \u9ED8\u8BA4 glm-5.3-flash)<input name="model" value="${escapeHtml(val("model", job?.model ?? ""))}" placeholder="glm-5.3-flash"></label>
-          <label>\u601D\u8003\u7B49\u7EA7(\u7559\u7A7A = \u9ED8\u8BA4 medium)<input name="effort" value="${escapeHtml(val("effort", job?.effort ?? ""))}" placeholder="medium"></label>
+          <label>\u5DE5\u5177<select name="tool">${toolOptions}</select></label>
+          <div class="ta-field-custom-cli" ${toolVal === "custom" ? "" : "hidden"}>
+            <label>CLI \u547D\u4EE4(\u5EFA\u8BAE\u7EDD\u5BF9\u8DEF\u5F84)<input name="cliCommand" value="${escapeHtml(val("cliCommand", job?.cli?.command ?? ""))}" placeholder="D:\\env\\nodejs\\node.exe"></label>
+            <label>CLI \u53C2\u6570(\u6A21\u677F,\u65E0 {{prompt}} \u65F6\u8D70 stdin)<input name="cliArgs" value="${escapeHtml(val("cliArgs", job?.cli?.args ?? ""))}" placeholder="--print"></label>
+          </div>
+          <label>\u6A21\u578B(\u53EF\u641C\u7D22/\u53EF\u8F93\u5165,\u9009\u4E2D\u540E\u81EA\u52A8\u5207\u5230\u5BF9\u5E94\u5DE5\u5177)<div class="ta-combo" data-combo="model"></div></label>
+          <label>\u601D\u8003\u7B49\u7EA7(claude=--effort / codex=model_reasoning_effort / opencode=--variant,\u7559\u7A7A = \u9ED8\u8BA4 medium)<input name="effort" value="${escapeHtml(val("effort", job?.effort ?? ""))}" placeholder="medium"></label>
         </div>
         <label class="ta-inline"><input name="enabled" type="checkbox" ${schedEnabled ? "checked" : ""}> \u542F\u7528\u8C03\u5EA6(\u5173\u95ED\u540E\u4EFB\u52A1\u53EA\u4FDD\u7559\u624B\u52A8\u6267\u884C)</label>
         <div class="ta-field-sched${schedEnabled ? "" : " ta-disabled"}">
@@ -428,9 +611,18 @@ var TimerAgentApp = class _TimerAgentApp {
       };
       enabledBox.addEventListener("change", syncSched);
     }
+    const dispatchBox = this.container.querySelector(".ta-field-dispatch");
+    const inboxBox = form.querySelector('[name="inbox"]');
+    if (dispatchBox !== null && inboxBox !== null) {
+      const syncInbox = () => {
+        dispatchBox.classList.toggle("ta-field-dispatch-on", inboxBox.checked);
+        dispatchBox.classList.toggle("ta-disabled", !inboxBox.checked);
+      };
+      inboxBox.addEventListener("change", syncInbox);
+    }
     form.querySelector('[name="kind"]').addEventListener("change", (event) => {
       const data = new FormData(form);
-      const preserve = ["title", "description", "prompt", "command", "args", "workdir", "customWorkdir", "cron", "intervalMin", "intervalUnit", "timeoutMin", "model", "effort", "enabled"];
+      const preserve = ["title", "description", "prompt", "command", "args", "workdir", "customWorkdir", "cron", "intervalMin", "intervalUnit", "timeoutMin", "model", "effort", "tool", "cliCommand", "cliArgs", "enabled", "inbox", "priority", "difficulty", "targetWs2", "targetProject"];
       this.formDraft = Object.fromEntries(preserve.map((name) => [name, String(data.get(name) ?? "")]));
       this.formKind = event.target.value === "command" ? "command" : "agent";
       this.renderForm();
@@ -442,12 +634,53 @@ var TimerAgentApp = class _TimerAgentApp {
         cronInput.value = value;
       }
     });
+    const toolSelect = form.querySelector('[name="tool"]');
+    const syncCustomCli = () => {
+      const cliBox = this.container.querySelector(".ta-field-custom-cli");
+      if (cliBox !== null) cliBox.hidden = toolSelect?.value !== "custom";
+    };
+    toolSelect?.addEventListener("change", syncCustomCli);
+    const modelHost = this.container.querySelector('.ta-combo[data-combo="model"]');
+    if (modelHost !== null) {
+      this.mountCombo(
+        modelHost,
+        "model",
+        this.modelOptions(),
+        val("model", job?.model ?? ""),
+        "\u7559\u7A7A = CLI \u81EA\u8EAB\u9ED8\u8BA4(claude \u8D70\u670D\u52A1\u7AEF\u914D\u7F6E)",
+        (option) => {
+          if (option.group !== void 0 && toolSelect !== null) {
+            toolSelect.value = option.group;
+            syncCustomCli();
+          }
+        }
+      );
+    }
+    const mountSessionCombo = () => {
+      const select = form.querySelector('[name="targetWs"]');
+      const workdir = select === null || select.value === "" || select.value === "custom" ? "" : select.selectedOptions[0]?.dataset.workdir ?? "";
+      const sessionHost = this.container.querySelector('.ta-combo[data-combo="session"]');
+      if (sessionHost !== null) {
+        this.mountCombo(
+          sessionHost,
+          "targetSession",
+          this.sessionOptions(workdir, job),
+          val("targetSession", job?.session ?? ""),
+          "\u65B0\u4F1A\u8BDD\u6253\u5F00(\u7559\u7A7A),\u6216\u641C\u7D22/\u8F93\u5165\u4F1A\u8BDD id",
+          void 0
+        );
+      }
+    };
+    mountSessionCombo();
     form.querySelector('[name="targetWs"]')?.addEventListener("change", (event) => {
       const select = event.target;
-      const workdir = select.value === "" || select.value === "custom" ? "" : select.selectedOptions[0]?.dataset.workdir ?? "";
-      const sessionSelect = form.querySelector('[name="targetSession"]');
-      if (sessionSelect !== null) sessionSelect.innerHTML = this.sessionOptions(workdir, job);
+      mountSessionCombo();
       const custom = form.querySelector(".ta-field-custom-ws");
+      if (custom !== null) custom.hidden = select.value !== "custom";
+    });
+    form.querySelector('[name="targetWs2"]')?.addEventListener("change", (event) => {
+      const select = event.target;
+      const custom = form.querySelector(".ta-field-custom-target");
       if (custom !== null) custom.hidden = select.value !== "custom";
     });
     form.addEventListener("submit", (event) => {
@@ -465,14 +698,20 @@ var TimerAgentApp = class _TimerAgentApp {
     const kind = data.get("kind") === "command" ? "command" : "agent";
     const cron = String(data.get("cron") ?? "").trim();
     const enabled = data.get("enabled") === "on";
+    const inbox = data.get("inbox") === "on";
     const intervalMin = Number(data.get("intervalMin"));
     const unitMin = Number(data.get("intervalUnit") ?? 1) || 1;
     const intervalMinutes = Number.isFinite(intervalMin) && intervalMin > 0 && unitMin > 0 ? Math.round(intervalMin * unitMin) : void 0;
-    if (intervalMinutes === void 0 && !isValidCron(cron)) {
+    if (!inbox && intervalMinutes === void 0 && !isValidCron(cron)) {
       window.alert("\u9700\u8981\u586B\u5199\u6709\u6548\u7684 cron \u8868\u8FBE\u5F0F,\u6216\u56FA\u5B9A\u95F4\u9694\u6570\u503C");
       return;
     }
     const timeoutMin = Number(data.get("timeoutMin"));
+    const priority = Number(data.get("priority"));
+    const difficulty = Number(data.get("difficulty"));
+    const targetWs2 = this.container.querySelector('[name="targetWs2"]');
+    const targetValue = targetWs2?.value ?? "";
+    const targetProject = targetValue === "" ? "" : targetValue === "custom" ? String(data.get("targetProject") ?? "") : targetWs2?.selectedOptions[0]?.dataset.workdir ?? "";
     let workdir = String(data.get("workdir") ?? "");
     let session = "";
     if (kind === "agent") {
@@ -488,9 +727,21 @@ var TimerAgentApp = class _TimerAgentApp {
       workdir,
       cron: intervalMinutes !== void 0 ? "" : cron,
       enabled,
+      inbox,
+      ...inbox ? {
+        priority: Number.isFinite(priority) ? priority : 3,
+        difficulty: Number.isFinite(difficulty) ? difficulty : 3,
+        targetProject
+      } : {},
       ...kind === "agent" ? {
         prompt: String(data.get("prompt") ?? ""),
         session,
+        // 'custom' → 手动 CLI 档(tool 留空,走 cli 覆盖);其余为目录里的工具 id。
+        tool: (() => {
+          const raw = String(data.get("tool") ?? "");
+          return raw === "custom" ? void 0 : raw;
+        })(),
+        cli: data.get("tool") === "custom" ? { command: String(data.get("cliCommand") ?? ""), args: String(data.get("cliArgs") ?? "") } : void 0,
         model: String(data.get("model") ?? "").trim(),
         effort: String(data.get("effort") ?? "").trim()
       } : {},
@@ -532,8 +783,15 @@ var TimerAgentApp = class _TimerAgentApp {
             ${schedule.lastTriggeredAt !== void 0 ? `<span class="ta-muted">\u4E0A\u6B21:</span>${formatTime(schedule.lastTriggeredAt)} \xB7 ` : ""}\u4E0B\u6B21:<strong>${formatTime(schedule.nextRunAt)}</strong>` : "\u672A\u914D\u7F6E\u8C03\u5EA6"}
           ${job.workdir ? ` \xB7 \u76EE\u5F55:<code>${escapeHtml(job.workdir)}</code>` : ""}
           ${job.session ? ` \xB7 \u4F1A\u8BDD:<code>${escapeHtml(job.session)}</code>` : ""}
-          ${kind === "agent" ? ` \xB7 \u6A21\u578B:<code>${escapeHtml(job.model || "glm-5.3-flash(\u9ED8\u8BA4)")}</code>/<code>${escapeHtml(job.effort || "medium(\u9ED8\u8BA4)")}</code>` : ""}
+          ${kind === "agent" ? ` \xB7 \u5DE5\u5177:<code>${escapeHtml(resolveAgentTool(job.tool)?.label ?? (job.cli?.command ? "\u81EA\u5B9A\u4E49" : "Claude(\u670D\u52A1\u7AEF\u9ED8\u8BA4)"))}</code> \xB7 \u6A21\u578B:<code>${escapeHtml(job.model || "glm-5.3-flash(\u9ED8\u8BA4)")}</code>/<code>${escapeHtml(job.effort || "medium(\u9ED8\u8BA4)")}</code>` : ""}
         </div>
+        ${job.inbox ? `<div class="ta-dispatch-meta">
+          <span class="ta-kind ta-kind-inbox">\u6536\u4EF6\u7BB1</span>
+          <span>\u4F18\u5148\u7EA7:<strong>${job.priority ?? 3}</strong>/5</span>
+          <span>\u96BE\u5EA6:<strong>${job.difficulty ?? 3}</strong>/5</span>
+          ${job.targetProject ? `<span>\u6D3E\u53D1\u76EE\u5F55:<code>${escapeHtml(job.targetProject)}</code></span>` : ""}
+          <span class="ta-muted">\u7A7A\u95F2\u65F6\u6309\u6700\u9AD8\u5206\u81EA\u52A8\u6D3E\u53D1</span>
+        </div>` : ""}
         <div class="ta-actions ta-row">
           <button class="ta-btn ta-primary" data-act="run">\u7ACB\u5373\u6267\u884C</button>
           <button class="ta-btn" data-act="edit">\u7F16\u8F91</button>
@@ -587,6 +845,8 @@ var CSS = `
 .ta-error { color: #f87171; padding: 16px; }
 .ta-search { flex: 1; max-width: 260px; padding: 6px 10px; border: 1px solid var(--ta-border);
   border-radius: 6px; background: transparent; color: inherit; }
+.ta-status-filter { padding: 6px 10px; border: 1px solid var(--ta-border); border-radius: 6px;
+  background: transparent; color: inherit; font-size: 12px; max-width: 140px; }
 .ta-btn { padding: 5px 10px; border: 1px solid var(--ta-border); border-radius: 6px;
   background: transparent; color: inherit; cursor: pointer; font-size: 12px; }
 .ta-btn:hover { background: var(--ta-hover); }
@@ -602,6 +862,7 @@ var CSS = `
   margin-right: 8px; border: 1px solid var(--ta-border); }
 .ta-kind-agent { color: #93c5fd; }
 .ta-kind-command { color: #fcd34d; }
+.ta-kind-inbox { color: #a78bfa; border-color: #a78bfa; }
 .ta-status { display: inline-block; font-size: 11px; border-radius: 999px; padding: 1px 8px; border: 1px solid var(--ta-border); }
 .ta-status-idle { color: var(--ta-muted); }
 .ta-status-running { color: #93c5fd; border-color: #93c5fd; }
@@ -620,8 +881,32 @@ var CSS = `
 .ta-interval-row input { flex: 1; }
 .ta-interval-row select { width: 76px; }
 .ta-disabled { opacity: .45; pointer-events: none; }
+.ta-dispatch { display: flex; align-items: center; gap: 12px; padding: 8px 12px; margin-bottom: 12px;
+  border: 1px solid var(--ta-border); border-radius: 8px; font-size: 12px; background: transparent; }
+.ta-dispatch-title { font-weight: 600; }
+.ta-field-dispatch { margin: 6px 0; padding: 8px 10px; border: 1px dashed var(--ta-border);
+  border-radius: 6px; display: grid; grid-template-columns: 110px 110px minmax(0, 1fr); gap: 10px; align-items: end; }
+.ta-field-dispatch-on { border-style: solid; border-color: #a78bfa; }
+.ta-field-dispatch .ta-field-custom-target { grid-column: 1 / -1; }
+.ta-dispatch-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
+  margin: 6px 0 10px; padding: 6px 10px; border: 1px dashed var(--ta-border); border-radius: 6px; font-size: 12px; }
+.ta-dispatch-meta strong { color: inherit; }
 .ta-detail p { margin: 0 0 8px; }
 .ta-meta { font-size: 13px; margin-bottom: 8px; }
+.ta-theme-dark { --ta-bg: #1e1e1e; }
+.ta-theme-light { --ta-bg: #ffffff; }
+.ta-combo { position: relative; }
+.ta-combo-display { width: 100%; }
+.ta-combo-menu { position: absolute; top: 100%; left: 0; right: 0; z-index: 40; max-height: 240px;
+  overflow-y: auto; margin-top: 2px; border: 1px solid var(--ta-border); border-radius: 6px;
+  background: var(--ta-bg, #1e1e1e); box-shadow: 0 4px 12px rgba(0, 0, 0, .25); }
+.ta-combo-group { padding: 4px 10px; font-size: 11px; color: var(--ta-muted);
+  border-bottom: 1px solid var(--ta-border); }
+.ta-combo-item { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 6px 10px; font-size: 12px; cursor: pointer; }
+.ta-combo-item:hover { background: var(--ta-hover); }
+.ta-combo-hint { color: var(--ta-muted); font-size: 11px; white-space: nowrap; }
+.ta-combo-empty { padding: 8px 10px; font-size: 12px; color: var(--ta-muted); }
 [hidden] { display: none !important; }
 `;
 var injected = false;
