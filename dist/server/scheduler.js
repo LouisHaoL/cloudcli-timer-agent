@@ -3,12 +3,16 @@
  * TimerRunner). For every due job the stored `nextRunAt` is advanced BEFORE
  * the run fires — a crash mid-run can never double-trigger; a stopped server
  * simply misses runs (no catch-up replay). A job that is still running skips
- * its occurrence. Skip-once: a `schedule.skipNextAt` equal to the due instant
+ * its occurrence. One-shot jobs (no cron / interval) instead CONSUME their
+ * `nextRunAt` when the run opens — scheduled fires, manual runs, success and
+ * failure all spend the single shot (settleExecution archives the job), while
+ * a skipped (already running) fire leaves it armed for the next tick.
+ * Skip-once: a `schedule.skipNextAt` equal to the due instant
  * consumes the skip and advances without firing. Manual runs arrive through
  * the ledger's `runRequestedAt` stamp (HTTP → ticker), same as the dsh
  * browser/tool → host channel.
  */
-import { intervalNextMs, isIntervalRule, isSchedulable, nextRunAtMs, scheduleNextMs } from '../shared/schedule.js';
+import { intervalNextMs, isIntervalRule, isOneShotRule, isSchedulable, nextRunAtMs, scheduleNextMs, } from '../shared/schedule.js';
 import { settleExecution, startExecution, trimExecutions, withRunRequest } from '../shared/jobs.js';
 import { runJob } from './runner.js';
 import { loadDispatchPolicy, nextInboxCandidate, routedWorkdir } from './dispatch.js';
@@ -21,6 +25,10 @@ const inFlight = new Set();
 function ensureNextRunAt(job, now) {
     const schedule = job.schedule;
     if (!schedule || !schedule.enabled || !isSchedulable(schedule))
+        return job;
+    // A one-shot's persisted instant is its whole schedule — never recomputed
+    // here. A past instant (e.g. resumed after a pause) must still fire.
+    if (isOneShotRule(schedule))
         return job;
     const current = schedule.nextRunAt;
     if (current !== undefined && current > now - 24 * 60 * 60 * 1000)
@@ -80,6 +88,16 @@ export async function tick(store, profile, now = Date.now()) {
                         },
                     };
                 }
+                // A manual run spends a one-shot's single shot too (settleExecution
+                // archives the job when the run settles; 'cancelled' leaves nothing
+                // armed either way — the shot is gone with the run that opened).
+                if (manualSchedule !== undefined && isOneShotRule(manualSchedule)
+                    && manualSchedule.nextRunAt !== undefined) {
+                    current = {
+                        ...current,
+                        schedule: { ...manualSchedule, nextRunAt: undefined, lastTriggeredAt: now },
+                    };
+                }
                 const opened = startExecution(withRunRequest(current, undefined, now), now, crypto.randomUUID(), 'manual');
                 current = trimExecutions(opened.job);
                 fired.push({ job: current, executionId: opened.execution.id, trigger: 'manual', scheduledFor: stamp });
@@ -100,19 +118,34 @@ export async function tick(store, profile, now = Date.now()) {
             const firedAt = schedule.nextRunAt;
             if (schedule.skipNextAt === firedAt) {
                 // Skip-once: consume the skip and move the grid forward silently.
-                const next2 = advanceSchedule({ ...current, schedule: { ...schedule, skipNextAt: undefined } }, firedAt, now);
+                // (A one-shot refuses skips at the API layer; if one ever lands here,
+                // only the skip stamp is cleared — the shot stays armed.)
+                const skipCleared = { ...schedule, skipNextAt: undefined };
+                const next2 = isOneShotRule(schedule)
+                    ? { ...current, updatedAt: now, schedule: skipCleared }
+                    : advanceSchedule({ ...current, schedule: skipCleared }, firedAt, now);
                 next.push(next2);
                 changed = true;
                 continue;
             }
             if (current.status === 'running' || inFlight.has(current.id)) {
                 // Still running: skip this occurrence, wait for the next cron match.
-                next.push(advanceSchedule(current, firedAt, now));
+                // A one-shot leaves its shot armed — the next tick retries it.
+                next.push(isOneShotRule(schedule) ? current : advanceSchedule(current, firedAt, now));
                 changed = true;
                 continue;
             }
-            // At-most-once: advance the grid first, then fire.
-            current = advanceSchedule(current, firedAt, now);
+            // At-most-once: advance the grid first, then fire. A one-shot instead
+            // CONSUMES nextRunAt in this same mutate (there is no "next" to
+            // compute): a crash between here and the run settling can never
+            // double-trigger, and settleExecution archives the job afterwards.
+            current = isOneShotRule(schedule)
+                ? {
+                    ...current,
+                    updatedAt: now,
+                    schedule: { ...schedule, nextRunAt: undefined, lastTriggeredAt: firedAt },
+                }
+                : advanceSchedule(current, firedAt, now);
             const opened = startExecution(current, now, crypto.randomUUID(), 'scheduled');
             current = trimExecutions(opened.job);
             fired.push({ job: current, executionId: opened.execution.id, trigger: 'scheduled', scheduledFor: firedAt });

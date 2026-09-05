@@ -10,6 +10,8 @@
  *
  * Framework-free so the server, the client and the tests share one module.
  */
+/** Job lifecycle status ('archived' freezes the job until restarted). */
+import { isOneShotRule } from './schedule.js';
 /** Resolve a job's kind; absent/unknown fields degrade to the 'agent' default. */
 export function jobKind(job) {
     return job.kind === 'command' ? 'command' : 'agent';
@@ -57,7 +59,18 @@ export function createJob(input, now, id) {
                     lastTriggeredAt: undefined,
                 },
             }
-            : {}),
+            : input.runAt !== undefined && input.runAt > 0
+                ? {
+                    // One-shot: no recurrence expression — the persisted instant is
+                    // the whole schedule, consumed by its single execution.
+                    schedule: {
+                        enabled: input.enabled ?? true,
+                        cron: '',
+                        nextRunAt: Math.round(input.runAt),
+                        lastTriggeredAt: undefined,
+                    },
+                }
+                : {}),
     };
     if (input.workdir?.trim())
         job.workdir = input.workdir.trim();
@@ -176,9 +189,17 @@ export function settleExecution(job, executionId, outcome, now, error, extra) {
     };
     const executions = [...job.executions];
     executions[index] = settled;
-    const status = outcome === 'succeeded' ? 'done'
-        : outcome === 'failed' ? 'failed'
-            : job.status === 'running' ? 'idle' : job.status;
+    // A ONE-SHOT job (schedule present, no cron / interval — see
+    // isOneShotRule) archives instead: it has fired its single `nextRunAt`, so
+    // success, failure, and a consumed manual run all land in 'archived'
+    // rather than 'done'/'failed'. 'cancelled' keeps the regular flow (back to
+    // idle) — a cancelled run has not consumed the one shot.
+    const oneShotConsumed = outcome !== 'cancelled' &&
+        job.schedule !== undefined && isOneShotRule(job.schedule);
+    const status = oneShotConsumed ? 'archived'
+        : outcome === 'succeeded' ? 'done'
+            : outcome === 'failed' ? 'failed'
+                : job.status === 'running' ? 'idle' : job.status;
     return { ...job, status, updatedAt: now, executions };
 }
 /** Cap the per-job execution history (most recent last). */

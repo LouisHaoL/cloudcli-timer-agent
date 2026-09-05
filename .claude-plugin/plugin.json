@@ -1,7 +1,7 @@
 {
   "name": "cloudcli-timer-agent",
   "description": "Cron & fixed-interval scheduler for AI agent prompts and command jobs, with a full management board (create/edit/detail/history). Ported from dsh-timer-agent.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "author": {
     "name": "LouisHaoL",
     "url": "https://github.com/LouisHaoL"

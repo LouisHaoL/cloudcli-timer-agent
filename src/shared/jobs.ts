@@ -12,6 +12,8 @@
  */
 
 /** Job lifecycle status ('archived' freezes the job until restarted). */
+import { isOneShotRule } from './schedule.js'
+
 export type JobStatus = 'idle' | 'running' | 'done' | 'failed' | 'archived'
 
 /** How a job executes. */
@@ -158,6 +160,12 @@ export interface NewJobInput {
   difficulty?: number
   /** Project workdir chosen at dispatch time (overrides `workdir`). */
   targetProject?: string
+  /**
+   * One-shot jobs: first (only) execution instant (ms epoch). Meaningful only
+   * when no cron / interval is given — that shape arms a {@link ScheduleRule}
+   * whose sole scheduling basis is this instant (see {@link isOneShotRule}).
+   */
+  runAt?: number
 }
 
 /** Clamp a dispatch priority to 1..5 (default 3). */
@@ -205,7 +213,18 @@ export function createJob(input: NewJobInput, now: number, id: string): JobRecor
             lastTriggeredAt: undefined,
           },
         }
-      : {}),
+      : input.runAt !== undefined && input.runAt > 0
+        ? {
+            // One-shot: no recurrence expression — the persisted instant is
+            // the whole schedule, consumed by its single execution.
+            schedule: {
+              enabled: input.enabled ?? true,
+              cron: '',
+              nextRunAt: Math.round(input.runAt),
+              lastTriggeredAt: undefined,
+            },
+          }
+        : {}),
   }
   if (input.workdir?.trim()) job.workdir = input.workdir.trim()
   if (input.tool?.trim()) job.tool = input.tool.trim()
@@ -321,9 +340,17 @@ export function settleExecution(
   }
   const executions = [...job.executions]
   executions[index] = settled
-  const status: JobStatus = outcome === 'succeeded' ? 'done'
-    : outcome === 'failed' ? 'failed'
-      : job.status === 'running' ? 'idle' : job.status
+  // A ONE-SHOT job (schedule present, no cron / interval — see
+  // isOneShotRule) archives instead: it has fired its single `nextRunAt`, so
+  // success, failure, and a consumed manual run all land in 'archived'
+  // rather than 'done'/'failed'. 'cancelled' keeps the regular flow (back to
+  // idle) — a cancelled run has not consumed the one shot.
+  const oneShotConsumed = outcome !== 'cancelled' &&
+    job.schedule !== undefined && isOneShotRule(job.schedule)
+  const status: JobStatus = oneShotConsumed ? 'archived'
+    : outcome === 'succeeded' ? 'done'
+      : outcome === 'failed' ? 'failed'
+        : job.status === 'running' ? 'idle' : job.status
   return { ...job, status, updatedAt: now, executions }
 }
 

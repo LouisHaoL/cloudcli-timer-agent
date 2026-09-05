@@ -1,60 +1,3 @@
-// src/shared/jobs.ts
-function jobKind(job) {
-  return job.kind === "command" ? "command" : "agent";
-}
-function commandLine(job) {
-  if (jobKind(job) !== "command") return "";
-  return `${job.command ?? ""} ${job.args ?? ""}`.trim();
-}
-
-// src/shared/agents.ts
-var AGENT_TOOLS = [
-  {
-    id: "claude",
-    label: "Claude",
-    command: "claude",
-    args: "--print --permission-mode bypassPermissions",
-    modelFlag: "--model",
-    effortStyle: "flag",
-    sessionFlag: "--resume",
-    inheritServerModel: true,
-    models: [
-      "glm-5.3-flash",
-      "glm-5.3",
-      "glm-4.7",
-      "glm-4.6",
-      "claude-opus-5",
-      "claude-sonnet-5",
-      "claude-haiku-4-5"
-    ]
-  },
-  {
-    id: "codex",
-    label: "Codex",
-    command: "codex",
-    args: "exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox",
-    modelFlag: "--model",
-    effortStyle: "config",
-    resumeSubcommand: "resume",
-    models: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4"]
-  },
-  {
-    id: "opencode",
-    label: "OpenCode",
-    command: "opencode",
-    args: "run --auto",
-    modelFlag: "--model",
-    effortStyle: "variant",
-    sessionFlag: "--session",
-    models: ["anthropic/claude-sonnet-4-5", "openai/gpt-5.4"]
-  }
-];
-function resolveAgentTool(id) {
-  const key = id?.trim();
-  if (key === void 0 || key === "") return void 0;
-  return AGENT_TOOLS.find((tool) => tool.id === key);
-}
-
 // src/shared/schedule.ts
 var FIELD_RANGES = [
   [0, 59],
@@ -95,6 +38,9 @@ function isValidCron(expr) {
 }
 function isIntervalRule(rule) {
   return rule !== null && rule !== void 0 && typeof rule.intervalMinutes === "number" && rule.intervalMinutes > 0;
+}
+function isOneShotRule(rule) {
+  return !isIntervalRule(rule) && (rule?.cron ?? "") === "";
 }
 function scheduleNextMs(rule, fromMs) {
   if (isIntervalRule(rule)) return fromMs + rule.intervalMinutes * 6e4;
@@ -155,6 +101,63 @@ function matches(schedule, date) {
 }
 function isDigits(value) {
   return /^\d+$/.test(value);
+}
+
+// src/shared/jobs.ts
+function jobKind(job) {
+  return job.kind === "command" ? "command" : "agent";
+}
+function commandLine(job) {
+  if (jobKind(job) !== "command") return "";
+  return `${job.command ?? ""} ${job.args ?? ""}`.trim();
+}
+
+// src/shared/agents.ts
+var AGENT_TOOLS = [
+  {
+    id: "claude",
+    label: "Claude",
+    command: "claude",
+    args: "--print --permission-mode bypassPermissions",
+    modelFlag: "--model",
+    effortStyle: "flag",
+    sessionFlag: "--resume",
+    inheritServerModel: true,
+    models: [
+      "glm-5.3-flash",
+      "glm-5.3",
+      "glm-4.7",
+      "glm-4.6",
+      "claude-opus-5",
+      "claude-sonnet-5",
+      "claude-haiku-4-5"
+    ]
+  },
+  {
+    id: "codex",
+    label: "Codex",
+    command: "codex",
+    args: "exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox",
+    modelFlag: "--model",
+    effortStyle: "config",
+    resumeSubcommand: "resume",
+    models: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4"]
+  },
+  {
+    id: "opencode",
+    label: "OpenCode",
+    command: "opencode",
+    args: "run --auto",
+    modelFlag: "--model",
+    effortStyle: "variant",
+    sessionFlag: "--session",
+    models: ["anthropic/claude-sonnet-4-5", "openai/gpt-5.4"]
+  }
+];
+function resolveAgentTool(id) {
+  const key = id?.trim();
+  if (key === void 0 || key === "") return void 0;
+  return AGENT_TOOLS.find((tool) => tool.id === key);
 }
 
 // src/client/api.ts
@@ -219,8 +222,15 @@ function pathBasename(path) {
 function escapeHtml(text) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
+function localInputValue(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
 function scheduleLabel(schedule) {
   if (schedule === void 0) return "\u2014";
+  if (isOneShotRule(schedule)) {
+    return schedule.nextRunAt !== void 0 ? `\u4E00\u6B21\u6027 \xB7 ${new Date(schedule.nextRunAt).toLocaleString()}` : "\u4E00\u6B21\u6027";
+  }
   const minutes = schedule.intervalMinutes;
   if (minutes !== void 0 && minutes > 0) {
     if (minutes % 1440 === 0) return `\u6BCF ${minutes / 1440} \u5929`;
@@ -231,6 +241,9 @@ function scheduleLabel(schedule) {
 }
 function isInterval(schedule) {
   return schedule !== void 0 && schedule.intervalMinutes !== void 0 && schedule.intervalMinutes > 0;
+}
+function isOnce(schedule) {
+  return isOneShotRule(schedule);
 }
 var TimerAgentApp = class _TimerAgentApp {
   constructor(container, api) {
@@ -252,6 +265,12 @@ var TimerAgentApp = class _TimerAgentApp {
   formKind;
   /** Text-field values preserved across the kind-toggle re-render. */
   formDraft;
+  /** Snapshot the fields that must survive a form re-render. */
+  captureFormDraft(form) {
+    const data = new FormData(form);
+    const preserve = ["title", "description", "prompt", "command", "args", "workdir", "customWorkdir", "cron", "intervalMin", "intervalUnit", "scheduleMode", "onceValue", "timeoutMin", "model", "effort", "tool", "cliCommand", "cliArgs", "enabled", "inbox", "priority", "difficulty", "targetWs2", "targetProject"];
+    return Object.fromEntries(preserve.map((name) => [name, String(data.get(name) ?? "")]));
+  }
   pollTimer;
   async start() {
     await this.refresh();
@@ -352,7 +371,7 @@ var TimerAgentApp = class _TimerAgentApp {
       }
     }
   }
-  async listAction(id, act) {
+  async listAction(id, act, nextRunAt) {
     try {
       if (act === "new" || act === "edit") {
         await this.loadTargets();
@@ -362,6 +381,7 @@ var TimerAgentApp = class _TimerAgentApp {
       } else if (act === "detail") this.selectedId = id;
       else if (act === "run") await this.api.action(id, "run-now");
       else if (act === "skip") await this.api.patch(id, { skipNext: true });
+      else if (act === "save-next") await this.api.patch(id, { nextRunAt });
       else if (act === "pause") await this.api.action(id, "pause");
       else if (act === "resume") await this.api.action(id, "resume");
       else if (act === "delete") {
@@ -527,11 +547,14 @@ var TimerAgentApp = class _TimerAgentApp {
     const kind = this.formKind ?? (job ? jobKind(job) : "agent");
     const draft = this.formDraft;
     const val = (name, fallback) => draft?.[name] ?? fallback;
-    const cron = val("cron", job?.schedule?.cron ?? "");
+    const cron = val("cron", "") || (job?.schedule?.cron ?? "");
     const schedEnabled = draft !== void 0 ? draft.enabled === "on" : job?.schedule?.enabled !== false;
     const iv = job?.schedule?.intervalMinutes;
-    const intervalUnit = val("intervalUnit", iv === void 0 ? "1" : iv % 1440 === 0 ? "1440" : iv % 60 === 0 ? "60" : "1");
-    const intervalValue = val("intervalMin", iv === void 0 ? "" : String(intervalUnit === "1440" ? iv / 1440 : intervalUnit === "60" ? iv / 60 : iv));
+    const intervalUnit = val("intervalUnit", "") || (iv === void 0 ? "1" : iv % 1440 === 0 ? "1440" : iv % 60 === 0 ? "60" : "1");
+    const intervalValue = val("intervalMin", "") || (iv === void 0 ? "" : String(intervalUnit === "1440" ? iv / 1440 : intervalUnit === "60" ? iv / 60 : iv));
+    const scheduleMode = val("scheduleMode", "") || (job === void 0 ? "cron" : isOnce(job.schedule) ? "once" : isInterval(job.schedule) ? "interval" : "cron");
+    const onceDefault = job !== void 0 && job.schedule !== void 0 && isOnce(job.schedule) && (job.schedule.nextRunAt ?? 0) > Date.now() ? localInputValue(new Date(job.schedule.nextRunAt)) : localInputValue(new Date(Date.now() + 60 * 6e4));
+    const onceValue = val("onceValue", "") || onceDefault;
     const presetOptions = CRON_PRESETS.map((preset) => `<option value="${preset.cron}" ${preset.cron === cron ? "selected" : ""}>${preset.label}</option>`).join("");
     const inboxOn = draft !== void 0 ? draft.inbox === "on" : job?.inbox === true;
     const toolVal = val("tool", job?.tool ?? "claude");
@@ -580,12 +603,25 @@ var TimerAgentApp = class _TimerAgentApp {
           <label>\u6A21\u578B(\u53EF\u641C\u7D22/\u53EF\u8F93\u5165,\u9009\u4E2D\u540E\u81EA\u52A8\u5207\u5230\u5BF9\u5E94\u5DE5\u5177)<div class="ta-combo" data-combo="model"></div></label>
           <label>\u601D\u8003\u7B49\u7EA7(claude=--effort / codex=model_reasoning_effort / opencode=--variant,\u7559\u7A7A = \u9ED8\u8BA4 medium)<input name="effort" value="${escapeHtml(val("effort", job?.effort ?? ""))}" placeholder="medium"></label>
         </div>
-        <label class="ta-inline"><input name="enabled" type="checkbox" ${schedEnabled ? "checked" : ""}> \u542F\u7528\u8C03\u5EA6(\u5173\u95ED\u540E\u4EFB\u52A1\u53EA\u4FDD\u7559\u624B\u52A8\u6267\u884C)</label>
+        <!-- \u5F00\u5173 + \u6A21\u5F0F\u4E0B\u62C9\u540C\u4E00\u884C:\u672A\u52FE\u9009\u65F6\u4E0B\u62C9\u7981\u7528(\u53EF\u89C1\u4F46\u4E0D\u53EF\u9009)\u3002 -->
+        <div class="ta-sched-row">
+          <label class="ta-inline"><input name="enabled" type="checkbox" ${schedEnabled ? "checked" : ""}> \u542F\u7528\u8C03\u5EA6(\u5173\u95ED\u540E\u4EFB\u52A1\u53EA\u4FDD\u7559\u624B\u52A8\u6267\u884C)</label>
+          <select name="scheduleMode" title="\u6267\u884C\u6A21\u5F0F" aria-label="\u6267\u884C\u6A21\u5F0F" ${schedEnabled ? "" : "disabled"}>
+            <option value="cron" ${scheduleMode === "cron" ? "selected" : ""}>Cron \u8868\u8FBE\u5F0F</option>
+            <option value="interval" ${scheduleMode === "interval" ? "selected" : ""}>\u56FA\u5B9A\u95F4\u9694</option>
+            <option value="once" ${scheduleMode === "once" ? "selected" : ""}>\u4E00\u6B21\u6027</option>
+          </select>
+        </div>
         <div class="ta-field-sched${schedEnabled ? "" : " ta-disabled"}">
+          ${scheduleMode === "once" ? `
+          <label>\u6267\u884C\u65F6\u95F4<input name="onceValue" type="datetime-local" value="${escapeHtml(onceValue)}"></label>
+          <span class="ta-muted">\u5230\u70B9\u6267\u884C\u4E00\u6B21\u540E\u4EFB\u52A1\u81EA\u52A8\u5F52\u6863(\u6210\u529F/\u5931\u8D25/\u624B\u52A8\u6267\u884C\u90FD\u6D88\u8017\u8FD9\u6B21\u673A\u4F1A)</span>
+          ` : scheduleMode === "cron" ? `
           <label>\u8C03\u5EA6(cron \u9884\u8BBE)<select name="preset">
             <option value="">\u2014 \u81EA\u5B9A\u4E49 \u2014</option>${presetOptions}</select></label>
           <label>5 \u6BB5 cron(\u5206 \u65F6 \u65E5 \u6708 \u5468)<input name="cron" value="${escapeHtml(cron)}" placeholder="0 9 * * *"></label>
-          <label>\u56FA\u5B9A\u95F4\u9694(\u586B\u4E86\u5219\u4F18\u5148\u4E8E cron)
+          ` : `
+          <label>\u56FA\u5B9A\u95F4\u9694(\u6BCF N \u5206\u949F/\u5C0F\u65F6/\u5929,\u951A\u5B9A\u4E0A\u6B21\u89E6\u53D1\u65F6\u523B)
             <span class="ta-interval-row">
               <input name="intervalMin" type="number" min="0" step="1" value="${escapeHtml(intervalValue)}" placeholder="\u5982 302">
               <select name="intervalUnit" title="\u65F6\u95F4\u5355\u4F4D">
@@ -595,6 +631,7 @@ var TimerAgentApp = class _TimerAgentApp {
               </select>
             </span>
           </label>
+          `}
         </div>
         <label>\u8D85\u65F6(\u5206\u949F,\u7559\u7A7A = \u9ED8\u8BA4 10)<input name="timeoutMin" type="number" min="0" step="1"
           value="${val("timeoutMin", job?.timeoutMs ? String(Math.round(job.timeoutMs / 6e4)) : "")}"></label>
@@ -608,6 +645,8 @@ var TimerAgentApp = class _TimerAgentApp {
     if (schedBox !== null && enabledBox !== null) {
       const syncSched = () => {
         schedBox.classList.toggle("ta-disabled", !enabledBox.checked);
+        const modeSelect = form.querySelector('[name="scheduleMode"]');
+        if (modeSelect !== null) modeSelect.disabled = !enabledBox.checked;
       };
       enabledBox.addEventListener("change", syncSched);
     }
@@ -621,13 +660,15 @@ var TimerAgentApp = class _TimerAgentApp {
       inboxBox.addEventListener("change", syncInbox);
     }
     form.querySelector('[name="kind"]').addEventListener("change", (event) => {
-      const data = new FormData(form);
-      const preserve = ["title", "description", "prompt", "command", "args", "workdir", "customWorkdir", "cron", "intervalMin", "intervalUnit", "timeoutMin", "model", "effort", "tool", "cliCommand", "cliArgs", "enabled", "inbox", "priority", "difficulty", "targetWs2", "targetProject"];
-      this.formDraft = Object.fromEntries(preserve.map((name) => [name, String(data.get(name) ?? "")]));
+      this.formDraft = this.captureFormDraft(form);
       this.formKind = event.target.value === "command" ? "command" : "agent";
       this.renderForm();
     });
-    form.querySelector('[name="preset"]').addEventListener("change", (event) => {
+    form.querySelector('[name="scheduleMode"]')?.addEventListener("change", () => {
+      this.formDraft = this.captureFormDraft(form);
+      this.renderForm();
+    });
+    form.querySelector('[name="preset"]')?.addEventListener("change", (event) => {
       const value = event.target.value;
       if (value !== "") {
         const cronInput = form.querySelector('[name="cron"]');
@@ -696,14 +737,20 @@ var TimerAgentApp = class _TimerAgentApp {
   }
   async submitForm(data, id) {
     const kind = data.get("kind") === "command" ? "command" : "agent";
-    const cron = String(data.get("cron") ?? "").trim();
     const enabled = data.get("enabled") === "on";
+    const scheduleMode = String(data.get("scheduleMode") ?? "cron");
+    const cron = String(data.get("cron") ?? "").trim();
     const inbox = data.get("inbox") === "on";
     const intervalMin = Number(data.get("intervalMin"));
     const unitMin = Number(data.get("intervalUnit") ?? 1) || 1;
-    const intervalMinutes = Number.isFinite(intervalMin) && intervalMin > 0 && unitMin > 0 ? Math.round(intervalMin * unitMin) : void 0;
-    if (!inbox && intervalMinutes === void 0 && !isValidCron(cron)) {
-      window.alert("\u9700\u8981\u586B\u5199\u6709\u6548\u7684 cron \u8868\u8FBE\u5F0F,\u6216\u56FA\u5B9A\u95F4\u9694\u6570\u503C");
+    const intervalMinutes = scheduleMode === "interval" && Number.isFinite(intervalMin) && intervalMin > 0 && unitMin > 0 ? Math.round(intervalMin * unitMin) : void 0;
+    const onceRunAt = scheduleMode === "once" ? new Date(String(data.get("onceValue") ?? "")).getTime() : void 0;
+    if (scheduleMode === "once" && !Number.isFinite(onceRunAt)) {
+      window.alert("\u8BF7\u9009\u62E9\u4E00\u6B21\u6027\u4EFB\u52A1\u7684\u6267\u884C\u65F6\u95F4");
+      return;
+    }
+    if (!inbox && intervalMinutes === void 0 && onceRunAt === void 0 && !isValidCron(cron)) {
+      window.alert("\u9700\u8981\u586B\u5199\u6709\u6548\u7684 cron \u8868\u8FBE\u5F0F\u3001\u56FA\u5B9A\u95F4\u9694\u6570\u503C,\u6216\u9009\u62E9\u4E00\u6B21\u6027\u6267\u884C\u65F6\u95F4");
       return;
     }
     const timeoutMin = Number(data.get("timeoutMin"));
@@ -725,7 +772,7 @@ var TimerAgentApp = class _TimerAgentApp {
       description: String(data.get("description") ?? ""),
       kind,
       workdir,
-      cron: intervalMinutes !== void 0 ? "" : cron,
+      cron: scheduleMode === "once" ? "" : intervalMinutes !== void 0 ? "" : cron,
       enabled,
       inbox,
       ...inbox ? {
@@ -747,6 +794,12 @@ var TimerAgentApp = class _TimerAgentApp {
       } : {},
       ...kind === "command" ? { command: String(data.get("command") ?? ""), args: String(data.get("args") ?? "") } : {},
       ...intervalMinutes !== void 0 ? { intervalMinutes } : {},
+      // 编辑时切回 cron 模式:清掉遗留的固定间隔(intervalMinutes: 0 → 清除)。
+      ...id !== void 0 && scheduleMode === "cron" && intervalMinutes === void 0 ? { intervalMinutes: 0 } : {},
+      // One-shot: create sends runAt (server arms nextRunAt from it); patch
+      // pins nextRunAt directly and clears a leftover interval so the edit
+      // can switch a recurring job over to one-shot mode.
+      ...onceRunAt !== void 0 && Number.isFinite(onceRunAt) ? id === void 0 ? { runAt: onceRunAt } : { intervalMinutes: 0, nextRunAt: onceRunAt } : {},
       ...Number.isFinite(timeoutMin) && timeoutMin > 0 ? { timeoutMs: Math.round(timeoutMin * 6e4) } : {}
     };
     try {
@@ -795,11 +848,20 @@ var TimerAgentApp = class _TimerAgentApp {
         <div class="ta-actions ta-row">
           <button class="ta-btn ta-primary" data-act="run">\u7ACB\u5373\u6267\u884C</button>
           <button class="ta-btn" data-act="edit">\u7F16\u8F91</button>
-          ${schedule && schedule.nextRunAt !== void 0 ? `<button class="ta-btn" data-act="skip" title="\u8DF3\u8FC7\u8FD9\u4E00\u6B21,\u4E0B\u6B21\u8FD0\u884C\u6539\u4E3A ${formatTime(scheduleNextMs(schedule, schedule.nextRunAt) ?? void 0)}">\u8DF3\u8FC7\u4E00\u6B21</button>` : ""}
+          ${schedule && schedule.nextRunAt !== void 0 && !isOnce(schedule) ? `<button class="ta-btn" data-act="skip" title="\u8DF3\u8FC7\u8FD9\u4E00\u6B21,\u4E0B\u6B21\u8FD0\u884C\u6539\u4E3A ${formatTime(scheduleNextMs(schedule, schedule.nextRunAt) ?? void 0)}">\u8DF3\u8FC7\u4E00\u6B21</button>` : ""}
           ${schedule ? `<button class="ta-btn" data-act="${schedule.enabled ? "pause" : "resume"}">${schedule.enabled ? "\u6682\u505C\u8C03\u5EA6" : "\u6062\u590D\u8C03\u5EA6"}</button>` : ""}
           <button class="ta-btn" data-act="${job.status === "archived" ? "restart" : "archive"}">${job.status === "archived" ? "\u6062\u590D\u5F52\u6863" : "\u5F52\u6863"}</button>
           <button class="ta-btn ta-danger" data-act="delete">\u5220\u9664</button>
         </div>
+        ${schedule !== void 0 && schedule.enabled && (isInterval(schedule) || isOnce(schedule)) ? `
+        <div class="ta-nextrun-row">
+          <span class="ta-muted">\u4FEE\u6539\u4E0B\u6B21\u6267\u884C\u65F6\u95F4</span>
+          <input type="datetime-local" data-nextrun
+            value="${schedule.nextRunAt !== void 0 ? localInputValue(new Date(schedule.nextRunAt)) : ""}"
+            aria-label="\u4E0B\u6B21\u8FD0\u884C">
+          <button class="ta-btn" data-act="save-next">\u4FDD\u5B58</button>
+          <span class="ta-muted">${isOnce(schedule) ? "\u4E00\u6B21\u6027\u4EFB\u52A1\u7684\u6267\u884C\u65F6\u95F4\u53EF\u5728\u8FD9\u91CC\u624B\u6539" : "\u56FA\u5B9A\u95F4\u9694\u4EFB\u52A1\u4F1A\u4EE5\u6B64\u4E3A\u951A\u70B9\u6EDA\u52A8"}</span>
+        </div>` : ""}
         <h3>\u6267\u884C\u5386\u53F2</h3>
         <table class="ta-table"><thead><tr><th>\u5F00\u59CB</th><th>\u89E6\u53D1</th><th>\u7ED3\u679C</th><th>\u8017\u65F6</th><th>\u8F93\u51FA</th></tr></thead>
           <tbody>${executions || '<tr><td colspan="5" class="ta-muted">\u5C1A\u672A\u6267\u884C</td></tr>'}</tbody></table>
@@ -807,6 +869,15 @@ var TimerAgentApp = class _TimerAgentApp {
     this.container.querySelector('[data-act="back"]')?.addEventListener("click", () => {
       this.selectedId = void 0;
       this.render();
+    });
+    this.container.querySelector('.ta-nextrun-row button[data-act="save-next"]')?.addEventListener("click", () => {
+      const input = this.container.querySelector(".ta-nextrun-row input[data-nextrun]");
+      const ms = input === null ? NaN : new Date(input.value).getTime();
+      if (!Number.isFinite(ms)) {
+        window.alert("\u8BF7\u9009\u62E9\u6709\u6548\u7684\u65E5\u671F\u65F6\u95F4");
+        return;
+      }
+      void this.listAction(id, "save-next", ms);
     });
     for (const button of Array.from(this.container.querySelectorAll(".ta-actions button[data-act]"))) {
       button.addEventListener("click", () => void this.listAction(id, button.dataset.act));
@@ -880,6 +951,12 @@ var CSS = `
 .ta-interval-row { display: flex; gap: 6px; }
 .ta-interval-row input { flex: 1; }
 .ta-interval-row select { width: 76px; }
+/* \u8C03\u5EA6\u5F00\u5173 + \u6267\u884C\u6A21\u5F0F\u4E0B\u62C9\u540C\u4E00\u884C(\u672A\u52FE\u9009\u65F6\u4E0B\u62C9\u7981\u7528,\u53EF\u89C1\u4F46\u4E0D\u53EF\u9009)\u3002 */
+.ta-sched-row { display: flex; align-items: center; gap: 12px; }
+.ta-sched-row select { width: 160px; }
+/* \u8BE6\u60C5\u9875\u624B\u6539\u4E0B\u6B21\u6267\u884C\u65F6\u95F4\u884C\u3002 */
+.ta-nextrun-row { display: flex; gap: 6px; align-items: center; margin: 8px 0; }
+.ta-nextrun-row input { flex: 0 1 240px; }
 .ta-disabled { opacity: .45; pointer-events: none; }
 .ta-dispatch { display: flex; align-items: center; gap: 12px; padding: 8px 12px; margin-bottom: 12px;
   border: 1px solid var(--ta-border); border-radius: 8px; font-size: 12px; background: transparent; }

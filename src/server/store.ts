@@ -62,19 +62,41 @@ function repairJob(value: unknown): JobRecord | null {
   let schedule: ScheduleRule | undefined
   if (typeof record.schedule === 'object' && record.schedule !== null) {
     const rule = record.schedule as Record<string, unknown>
-    const cron = typeof rule.cron === 'string' && isValidCron(rule.cron) ? rule.cron : ''
+    const rawCron = typeof rule.cron === 'string' ? rule.cron.trim() : ''
+    const cron = isValidCron(rawCron) ? rawCron : ''
     // Fixed-interval mode: intervalMinutes > 0 replaces cron as the schedulable
     // field (an interval job has cron === '' and must not be force-disabled).
     const intervalMinutes = typeof rule.intervalMinutes === 'number' && rule.intervalMinutes > 0
       ? Math.round(rule.intervalMinutes)
       : undefined
-    schedule = {
-      enabled: rule.enabled === true && (cron !== '' || intervalMinutes !== undefined),
-      cron,
-      nextRunAt: typeof rule.nextRunAt === 'number' ? rule.nextRunAt : undefined,
-      lastTriggeredAt: typeof rule.lastTriggeredAt === 'number' ? rule.lastTriggeredAt : undefined,
-      ...(intervalMinutes !== undefined ? { intervalMinutes } : {}),
-      ...(typeof rule.skipNextAt === 'number' ? { skipNextAt: rule.skipNextAt } : {}),
+    const nextRunAt = typeof rule.nextRunAt === 'number' ? rule.nextRunAt : undefined
+    const lastTriggeredAt = typeof rule.lastTriggeredAt === 'number' ? rule.lastTriggeredAt : undefined
+    if (intervalMinutes === undefined && rawCron === '') {
+      // One-shot shape: needs positive evidence (a pending instant, or the
+      // lastTriggeredAt left by the consumption that cleared it). A blank
+      // rule with no evidence is a legacy no-schedule row and stays dropped
+      // (it must never start counting as a one-shot: settleExecution
+      // archives those).
+      if (nextRunAt !== undefined || lastTriggeredAt !== undefined) {
+        schedule = {
+          enabled: rule.enabled === true && nextRunAt !== undefined,
+          cron: '',
+          nextRunAt,
+          lastTriggeredAt,
+          ...(typeof rule.skipNextAt === 'number' ? { skipNextAt: rule.skipNextAt } : {}),
+        }
+      }
+    } else if (intervalMinutes === undefined && cron === '') {
+      // Non-blank but invalid cron: unusable, drop the rule.
+    } else {
+      schedule = {
+        enabled: rule.enabled === true && (cron !== '' || intervalMinutes !== undefined),
+        cron,
+        nextRunAt,
+        lastTriggeredAt,
+        ...(intervalMinutes !== undefined ? { intervalMinutes } : {}),
+        ...(typeof rule.skipNextAt === 'number' ? { skipNextAt: rule.skipNextAt } : {}),
+      }
     }
   }
   let cli: CliProfile | undefined

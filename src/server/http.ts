@@ -9,7 +9,10 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import { intervalNextMs, isIntervalRule, isValidCron, nextRunAtMs, scheduleNextMs } from '../shared/schedule.js'
+import {
+  intervalNextMs, isIntervalRule, isOneShotRule, isSchedulable, isValidCron,
+  nextRunAtMs, resumeNextMs, scheduleNextMs,
+} from '../shared/schedule.js'
 import type { JobRecord, NewJobInput, ScheduleRule } from '../shared/jobs.js'
 import { createJob, jobKind, normalizeDifficulty, normalizePriority, withSchedule, withStatus } from '../shared/jobs.js'
 import type { JobStore } from './store.js'
@@ -60,6 +63,32 @@ function checkCron(cron: unknown): string | undefined {
   const value = cron.trim()
   if (value !== '' && !isValidCron(value)) throw new ApiError(400, `invalid cron expression: ${value}`)
   return value
+}
+
+/**
+ * The REAL last-execution instant a resume/restart re-anchors on: the latest
+ * execution's startedAt (a manual run counts — it re-anchored the grid too),
+ * falling back to the schedule's lastTriggeredAt for rows that never ran.
+ */
+function lastExecutionMs(job: JobRecord): number | undefined {
+  return job.executions.length > 0
+    ? job.executions[job.executions.length - 1].startedAt
+    : job.schedule?.lastTriggeredAt ?? undefined
+}
+
+/**
+ * Parse a body instant (ms epoch number, or ISO datetime string) into a
+ * finite positive ms epoch; undefined when absent or unparseable.
+ */
+function readInstantMs(value: unknown): number | undefined {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value > 0 ? Math.round(value) : undefined
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Date.parse(value.trim())
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+  }
+  return undefined
 }
 
 class ApiError extends Error {
@@ -222,7 +251,9 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
 }
 
 /** Re-anchor a schedule at `now`: an interval grid continues from the last
- *  trigger (stacking whole intervals past the gap); cron follows its grid. */
+ *  trigger (stacking whole intervals past the gap); cron follows its grid.
+ *  One-shot rules must not come through here (the persisted instant IS the
+ *  schedule) — callers guard with isOneShotRule. */
 function reanchorMs(schedule: ScheduleRule, now: number): number | undefined {
   return isIntervalRule(schedule)
     ? intervalNextMs(schedule.lastTriggeredAt, schedule.intervalMinutes!, now)
@@ -236,18 +267,33 @@ async function create(response: ServerResponse, store: JobStore, body: Partial<N
   const interval = body?.intervalMinutes !== undefined && body.intervalMinutes > 0
     ? Math.round(body.intervalMinutes)
     : undefined
+  // One-shot alternative: a single runAt instant (ms epoch or ISO) when
+  // neither cron nor interval is given. With cron/interval present it is
+  // ignored (precedence interval > cron > runAt, no error).
+  const runAt = interval === undefined && cron === '' ? readInstantMs(body?.runAt) : undefined
+  if (interval === undefined && cron === '' && body?.runAt !== undefined && runAt === undefined) {
+    throw new ApiError(400, 'invalid runAt (expected a ms epoch number or ISO datetime string)')
+  }
   const inbox = body?.inbox === true
-  if (cron === '' && interval === undefined && !inbox) throw new ApiError(400, 'cron, intervalMinutes, or inbox is required')
+  if (cron === '' && interval === undefined && runAt === undefined && !inbox) {
+    throw new ApiError(400, 'cron, intervalMinutes, runAt, or inbox is required')
+  }
   const kind = body?.kind === 'command' ? 'command' : 'agent'
   if (kind === 'agent' && (body?.prompt ?? '').trim() === '') throw new ApiError(400, 'prompt is required for agent jobs')
   if (kind === 'command' && (body?.command ?? '').trim() === '') throw new ApiError(400, 'command is required for command jobs')
   const now = Date.now()
   const input: NewJobInput = { ...(body as NewJobInput), kind, cron, title }
+  if (runAt !== undefined) input.runAt = runAt // parsed (an ISO string is not usable as an instant)
+  else delete input.runAt // cron/interval take precedence; a stray runAt is ignored
   if (!inbox) delete input.inbox
   const job = createJob(input, now, crypto.randomUUID())
   const scheduled = job.schedule !== undefined && job.schedule.enabled
     ? withSchedule(job, {
-        nextRunAt: interval !== undefined ? now + interval * 60_000 : nextRunAtMs(job.schedule.cron, now),
+        nextRunAt: interval !== undefined
+          ? now + interval * 60_000
+          : isOneShotRule(job.schedule)
+            ? job.schedule.nextRunAt // the runAt instant, armed by createJob
+            : nextRunAtMs(job.schedule.cron, now),
       }, now)
     : job
   await store.mutate(jobs => ({ jobs: [...jobs, scheduled], result: undefined }))
@@ -264,6 +310,9 @@ async function patch(response: ServerResponse, store: JobStore, id: string, body
     if (body.skipNext === true) {
       const nextAt = job.schedule?.nextRunAt
       if (nextAt === undefined) throw new ApiError(400, 'job has no upcoming run to skip')
+      // A one-shot has no "next occurrence" to skip — refusing (the UI hides
+      // the action) beats silently spending the only shot.
+      if (isOneShotRule(job.schedule)) throw new ApiError(400, 'a one-time job has no next occurrence to skip')
       job = withSchedule(job, { skipNextAt: nextAt }, now)
       return { jobs: jobs.map((item, at) => (at === index ? job : item)), result: job }
     }
@@ -323,13 +372,46 @@ async function patch(response: ServerResponse, store: JobStore, id: string, body
       // An explicit cron clears interval mode; '' alone clears the cron field.
       job = withSchedule(job, cron !== '' ? { cron, intervalMinutes: undefined } : { cron }, now)
     }
+    // Hand-pinned next run (interval and one-shot modes — the persisted
+    // instant IS their execution basis). A cron grid refuses: its instants
+    // belong to the expression, edit that instead. A job without a schedule
+    // refuses too (nothing for the instant to attach to).
+    let pinnedNextRunAt: number | undefined
+    if (body.nextRunAt !== undefined) {
+      const pinned = readInstantMs(body.nextRunAt)
+      if (pinned === undefined) throw new ApiError(400, 'invalid nextRunAt (expected a ms epoch number or ISO datetime string)')
+      if (job.schedule === undefined) throw new ApiError(400, 'job has no schedule to pin a next run to')
+      if ((job.schedule.cron ?? '') !== '') throw new ApiError(400, 'cron jobs own their next run; edit the cron expression instead')
+      pinnedNextRunAt = pinned
+      job = withSchedule(job, { nextRunAt: pinned }, now)
+    }
     if (typeof body.enabled === 'boolean') {
       if (job.schedule === undefined && cron === undefined) throw new ApiError(400, 'job has no cron schedule')
-      job = withSchedule(job, { enabled: body.enabled }, now)
+      if (body.enabled) {
+        // Resume re-anchors on the REAL last execution, skipping missed slots
+        // (no catch-up replay). A one-shot passes its persisted instant
+        // through even when past — resuming deliberately fires the pending
+        // shot on the next tick.
+        const schedule = job.schedule!
+        const armed = isOneShotRule(schedule)
+          ? schedule.nextRunAt
+          : resumeNextMs(schedule, lastExecutionMs(job), now)
+        if (armed === undefined) throw new ApiError(400, 'cannot compute the next run (invalid cron expression?)')
+        job = withSchedule(job, { enabled: true, nextRunAt: armed }, now)
+      } else {
+        // Pause keeps the persisted nextRunAt: the pending instant (a
+        // one-shot's whole schedule in particular) survives the pause and
+        // re-arms unchanged on resume.
+        job = withSchedule(job, { enabled: false }, now)
+      }
     }
-    if (job.schedule?.enabled === true && (cron !== undefined || job.schedule.nextRunAt === undefined)) {
+    // Re-anchor guard excludes one-shot rules (the persisted instant is the
+    // schedule) and a just-pinned nextRunAt (user-owned, not pipeline-owned).
+    if (pinnedNextRunAt === undefined && job.schedule?.enabled === true && !isOneShotRule(job.schedule) &&
+      (cron !== undefined || job.schedule.nextRunAt === undefined)) {
       job = withSchedule(job, { nextRunAt: reanchorMs(job.schedule, now) }, now)
-    } else if (intervalPatched && job.schedule?.enabled === true &&
+    } else if (pinnedNextRunAt === undefined && intervalPatched && job.schedule?.enabled === true &&
+      !isOneShotRule(job.schedule) &&
       (job.schedule.nextRunAt === undefined || job.schedule.nextRunAt <= now)) {
       // Interval switch: keep a still-future nextRunAt (e.g. a hand-pinned
       // first-run time); otherwise re-anchor on the last trigger.
@@ -353,9 +435,19 @@ async function runAction(response: ServerResponse, store: JobStore, tick: () => 
         if (index === -1) return undefined
         const job = jobs[index]!
         if (job.schedule === undefined) throw new ApiError(400, 'job has no schedule')
+        // Pause keeps the persisted nextRunAt (a pending one-shot survives
+        // the pause). Resume recomputes from the REAL last execution — missed
+        // slots are not replayed; a one-shot's own instant passes through
+        // even when past (the resume deliberately fires it).
+        const armed = enabled
+          ? isOneShotRule(job.schedule)
+            ? job.schedule.nextRunAt
+            : resumeNextMs(job.schedule, lastExecutionMs(job), now)
+          : undefined
+        if (enabled && armed === undefined) throw new ApiError(400, 'cannot compute the next run (invalid cron expression?)')
         const next = withSchedule(
           withStatus(job, job.status === 'archived' ? 'idle' : job.status, now),
-          { enabled, ...(enabled ? { nextRunAt: reanchorMs(job.schedule, now) } : {}) },
+          { enabled, ...(enabled ? { nextRunAt: armed } : {}) },
           now,
         )
         return { jobs: jobs.map((item, at) => (at === index ? next : item)), result: next }
@@ -369,7 +461,17 @@ async function runAction(response: ServerResponse, store: JobStore, tick: () => 
       const updated = await store.mutate(jobs => {
         const index = jobs.findIndex(job => job.id === id)
         if (index === -1) return undefined
-        const next = withStatus(jobs[index]!, status, now)
+        let next = withStatus(jobs[index]!, status, now)
+        // Restart un-archives: back to idle; a recurring schedule re-arms
+        // from the real last execution (missed slots skipped). A one-shot
+        // restart has nothing to re-arm — its instant was consumed by the
+        // run that archived it — so the schedule stays exactly as it is.
+        const schedule = next.schedule
+        if (status === 'idle' && schedule?.enabled === true && isSchedulable(schedule) && !isOneShotRule(schedule)) {
+          const armed = resumeNextMs(schedule, lastExecutionMs(next), now)
+          if (armed === undefined) throw new ApiError(400, 'cannot compute the next run (invalid cron expression?)')
+          next = withSchedule(next, { enabled: true, nextRunAt: armed }, now)
+        }
         return { jobs: jobs.map((item, at) => (at === index ? next : item)), result: next }
       })
       if (updated === undefined) throw new ApiError(404, `job not found: ${id}`)

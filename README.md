@@ -7,10 +7,11 @@
 Scheduled Prompt 只支持 daily/weekly/monthly 等预设枚举,**不支持 cron 表达式**;本插件恢复 dsh-timer-agent 的完整能力:
 
 - **5 段 cron**(分 时 日 月 周,`*` / `*/n` / `a-b` / 逗号列表,day+weekday OR 语义)+ 新建/编辑页的预设下拉(每天 09:00 / 每小时 / 每 10 分钟 / 每周一 09:00 / 工作日 09:00 / 月初 10:00)
+- **一次性任务**:只设执行时间(新建页"一次性"模式,默认当前 +1h),到点执行一次后任务自动归档;成功/失败/手动执行都会消耗这次机会;详情页可手改执行时间
 - **两种任务类型**:
   - **AI Agent 任务**(默认):到点把 prompt 喂给配置的 CLI(`{{prompt}}` 占位或 stdin 注入),支持每任务覆盖 CLI 命令/参数/超时
   - **普通任务(命令)**:到点直接 spawn `命令 + 参数`(不经过 AI、不消耗额度),stdout/stderr 尾部(≤16k 字符)与退出码入账
-- **跳过一次**:详情页一键跳过下一个触发点,之后照常
+- **跳过一次**:详情页一键跳过下一个触发点,之后照常(一次性任务没有"下一次",不提供)
 - **执行历史**:每次触发的结果/耗时/输出尾部/错误原因(上限 200 条)
 - **收件箱自动派发**:`inbox: true` 的任务进入队列,按 `priority`+`difficulty`+等待时长打分,空闲时自动跑最高分;可用 `targetProject` 指定执行所在目录
 - **立即执行 / 暂停 / 恢复 / 归档 / 搜索**
@@ -38,11 +39,13 @@ npm install && npm run build
 
 ## 调度语义(继承 dsh-timer-agent)
 
-- server 每 30s 一拍;**at-most-once**:先顺延 `nextRunAt` 再触发,崩溃不会重复触发
+- server 每 30s 一拍;**执行完全由持久化的 `nextRunAt` 驱动**,cron/固定间隔只负责计算它;**at-most-once**:先顺延(一次性任务为消耗)`nextRunAt` 再触发,崩溃不会重复触发
 - **错过即跳过**:server 停机期间到点的任务不补跑(重启后仅执行已顺延到期的那一次)
+- **一次性任务**:`nextRunAt` 即整个调度;触发一次即消耗,执行结算(成功/失败)后任务归档,手动执行同样消耗;运行中到点不消耗,下一拍重试;`nextRunAt` 可在详情页/`PATCH nextRunAt` 手改
+- **暂停保留 `nextRunAt`**(不再清空);恢复基于真实上次执行时间(最后一条 execution.startedAt,回退 lastTriggeredAt)重算,**错过不补跑**,跳到下一个未来时间点(一次性任务恢复后仍按原时刻触发,哪怕已过期——恢复即有意补发)
 - **固定间隔锚定上次触发**:`下次 = 上次触发 + N`;停机/暂停/长任务跨过的空窗按整间隔叠加到未来,网格永不漂移到"当前时间";**手动执行也算上次触发**(下次 = 手动时刻 + N)
-- 任务运行中到点 → 跳过本次,等下一个 cron 匹配点
-- cron 按本机本地时间解析
+- 任务运行中到点 → 跳过本次,等下一个 cron 匹配点(一次性任务保持待发,下一拍重试)
+- cron 按本机本地时间解析;归档后恢复:循环任务按真实上次执行重算,一次性任务无事可重算、保持原样
 
 ## Agent 任务的执行模型
 
@@ -58,8 +61,8 @@ npm install && npm run build
 |---|---|---|
 | GET | `/health` | 健康检查 |
 | GET | `/v1/jobs` | 刷新并返回全部任务 |
-| POST | `/v1/jobs` | 创建任务 |
-| PATCH | `/v1/jobs/:id` | 更新(`{"skipNext":true}` = 跳过一次) |
+| POST | `/v1/jobs` | 创建任务(`runAt` = 一次性执行时间,ms epoch 或 ISO;优先级 interval > cron > runAt) |
+| PATCH | `/v1/jobs/:id` | 更新(`{"skipNext":true}` = 跳过一次;`{"nextRunAt":…}` = 手改下次执行时间,仅固定间隔/一次性) |
 | DELETE | `/v1/jobs/:id` | 删除 |
 | POST | `/v1/jobs/:id/actions/{pause,resume,run-now,archive,restart}` | 操作 |
 | GET/PUT | `/v1/profile` | server 默认 CLI 执行档 |

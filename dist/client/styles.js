@@ -49,6 +49,12 @@ const CSS = `
 .ta-interval-row { display: flex; gap: 6px; }
 .ta-interval-row input { flex: 1; }
 .ta-interval-row select { width: 76px; }
+/* 调度开关 + 执行模式下拉同一行(未勾选时下拉禁用,可见但不可选)。 */
+.ta-sched-row { display: flex; align-items: center; gap: 12px; }
+.ta-sched-row select { width: 160px; }
+/* 详情页手改下次执行时间行。 */
+.ta-nextrun-row { display: flex; gap: 6px; align-items: center; margin: 8px 0; }
+.ta-nextrun-row input { flex: 0 1 240px; }
 .ta-disabled { opacity: .45; pointer-events: none; }
 .ta-dispatch { display: flex; align-items: center; gap: 12px; padding: 8px 12px; margin-bottom: 12px;
   border: 1px solid var(--ta-border); border-radius: 8px; font-size: 12px; background: transparent; }

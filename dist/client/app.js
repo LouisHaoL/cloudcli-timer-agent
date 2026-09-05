@@ -1,6 +1,6 @@
 import { commandLine, jobKind } from '../shared/jobs.js';
 import { AGENT_TOOLS, resolveAgentTool } from '../shared/agents.js';
-import { isValidCron, scheduleNextMs } from '../shared/schedule.js';
+import { isOneShotRule, isValidCron, scheduleNextMs } from '../shared/schedule.js';
 import { createApi } from './api.js';
 /** Cron presets the create/edit form offers (each generates an expression). */
 const CRON_PRESETS = [
@@ -35,10 +35,21 @@ function pathBasename(path) {
 function escapeHtml(text) {
     return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
-/** Schedule display label: cron expression, or a prettified fixed interval. */
+/** Local `datetime-local` input value for `date`, at minute precision. */
+function localInputValue(date) {
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+/** Schedule display label: cron expression, a prettified fixed interval, or the one-shot instant. */
 function scheduleLabel(schedule) {
     if (schedule === undefined)
         return '—';
+    // One-shot: the persisted nextRunAt is the whole schedule — show it inline.
+    if (isOneShotRule(schedule)) {
+        return schedule.nextRunAt !== undefined
+            ? `一次性 · ${new Date(schedule.nextRunAt).toLocaleString()}`
+            : '一次性';
+    }
     const minutes = schedule.intervalMinutes;
     if (minutes !== undefined && minutes > 0) {
         if (minutes % 1440 === 0)
@@ -52,6 +63,10 @@ function scheduleLabel(schedule) {
 /** True when the schedule runs on a fixed interval instead of cron. */
 function isInterval(schedule) {
     return schedule !== undefined && schedule.intervalMinutes !== undefined && schedule.intervalMinutes > 0;
+}
+/** True when the rule is a one-shot (no cron, no interval — see isOneShotRule). */
+function isOnce(schedule) {
+    return isOneShotRule(schedule);
 }
 export class TimerAgentApp {
     container;
@@ -69,6 +84,12 @@ export class TimerAgentApp {
     formKind;
     /** Text-field values preserved across the kind-toggle re-render. */
     formDraft;
+    /** Snapshot the fields that must survive a form re-render. */
+    captureFormDraft(form) {
+        const data = new FormData(form);
+        const preserve = ['title', 'description', 'prompt', 'command', 'args', 'workdir', 'customWorkdir', 'cron', 'intervalMin', 'intervalUnit', 'scheduleMode', 'onceValue', 'timeoutMin', 'model', 'effort', 'tool', 'cliCommand', 'cliArgs', 'enabled', 'inbox', 'priority', 'difficulty', 'targetWs2', 'targetProject'];
+        return Object.fromEntries(preserve.map(name => [name, String(data.get(name) ?? '')]));
+    }
     pollTimer;
     constructor(container, api) {
         this.container = container;
@@ -186,7 +207,7 @@ export class TimerAgentApp {
             }
         }
     }
-    async listAction(id, act) {
+    async listAction(id, act, nextRunAt) {
         try {
             if (act === 'new' || act === 'edit') {
                 await this.loadTargets();
@@ -200,6 +221,8 @@ export class TimerAgentApp {
                 await this.api.action(id, 'run-now');
             else if (act === 'skip')
                 await this.api.patch(id, { skipNext: true });
+            else if (act === 'save-next')
+                await this.api.patch(id, { nextRunAt });
             else if (act === 'pause')
                 await this.api.action(id, 'pause');
             else if (act === 'resume')
@@ -383,13 +406,24 @@ export class TimerAgentApp {
         const kind = this.formKind ?? (job ? jobKind(job) : 'agent');
         const draft = this.formDraft;
         const val = (name, fallback) => draft?.[name] ?? fallback;
-        const cron = val('cron', job?.schedule?.cron ?? '');
+        const cron = val('cron', '') || (job?.schedule?.cron ?? '');
         // 调度开关 + 固定间隔的数值/单位(单位随 kind 切换的草稿一起保留)。
         const schedEnabled = draft !== undefined ? draft.enabled === 'on' : job?.schedule?.enabled !== false;
         const iv = job?.schedule?.intervalMinutes;
-        const intervalUnit = val('intervalUnit', iv === undefined ? '1' : iv % 1440 === 0 ? '1440' : iv % 60 === 0 ? '60' : '1');
-        const intervalValue = val('intervalMin', iv === undefined ? ''
+        const intervalUnit = val('intervalUnit', '') || (iv === undefined ? '1' : iv % 1440 === 0 ? '1440' : iv % 60 === 0 ? '60' : '1');
+        const intervalValue = val('intervalMin', '') || (iv === undefined ? ''
             : String(intervalUnit === '1440' ? iv / 1440 : intervalUnit === '60' ? iv / 60 : iv));
+        // 执行模式(新建页下拉):一次性任务的草稿默认当前 +1h —— 一个"快到但
+        // 不立刻"的合理起点,用户从它微调,而不是面对空输入框。
+        const scheduleMode = (val('scheduleMode', '') || (job === undefined
+            ? 'cron'
+            : isOnce(job.schedule) ? 'once' : isInterval(job.schedule) ? 'interval' : 'cron'));
+        const onceDefault = job !== undefined && job.schedule !== undefined && isOnce(job.schedule)
+            && (job.schedule.nextRunAt ?? 0) > Date.now()
+            ? localInputValue(new Date(job.schedule.nextRunAt))
+            : localInputValue(new Date(Date.now() + 60 * 60_000));
+        // 切换模式时 FormData 会把未渲染字段的空字符串存进草稿,这里回落到默认值。
+        const onceValue = val('onceValue', '') || onceDefault;
         const presetOptions = CRON_PRESETS.map(preset => `<option value="${preset.cron}" ${preset.cron === cron ? 'selected' : ''}>${preset.label}</option>`).join('');
         const inboxOn = draft !== undefined ? draft.inbox === 'on' : job?.inbox === true;
         const toolVal = val('tool', job?.tool ?? 'claude');
@@ -440,12 +474,25 @@ export class TimerAgentApp {
           <label>模型(可搜索/可输入,选中后自动切到对应工具)<div class="ta-combo" data-combo="model"></div></label>
           <label>思考等级(claude=--effort / codex=model_reasoning_effort / opencode=--variant,留空 = 默认 medium)<input name="effort" value="${escapeHtml(val('effort', job?.effort ?? ''))}" placeholder="medium"></label>
         </div>
-        <label class="ta-inline"><input name="enabled" type="checkbox" ${schedEnabled ? 'checked' : ''}> 启用调度(关闭后任务只保留手动执行)</label>
+        <!-- 开关 + 模式下拉同一行:未勾选时下拉禁用(可见但不可选)。 -->
+        <div class="ta-sched-row">
+          <label class="ta-inline"><input name="enabled" type="checkbox" ${schedEnabled ? 'checked' : ''}> 启用调度(关闭后任务只保留手动执行)</label>
+          <select name="scheduleMode" title="执行模式" aria-label="执行模式" ${schedEnabled ? '' : 'disabled'}>
+            <option value="cron" ${scheduleMode === 'cron' ? 'selected' : ''}>Cron 表达式</option>
+            <option value="interval" ${scheduleMode === 'interval' ? 'selected' : ''}>固定间隔</option>
+            <option value="once" ${scheduleMode === 'once' ? 'selected' : ''}>一次性</option>
+          </select>
+        </div>
         <div class="ta-field-sched${schedEnabled ? '' : ' ta-disabled'}">
+          ${scheduleMode === 'once' ? `
+          <label>执行时间<input name="onceValue" type="datetime-local" value="${escapeHtml(onceValue)}"></label>
+          <span class="ta-muted">到点执行一次后任务自动归档(成功/失败/手动执行都消耗这次机会)</span>
+          ` : scheduleMode === 'cron' ? `
           <label>调度(cron 预设)<select name="preset">
             <option value="">— 自定义 —</option>${presetOptions}</select></label>
           <label>5 段 cron(分 时 日 月 周)<input name="cron" value="${escapeHtml(cron)}" placeholder="0 9 * * *"></label>
-          <label>固定间隔(填了则优先于 cron)
+          ` : `
+          <label>固定间隔(每 N 分钟/小时/天,锚定上次触发时刻)
             <span class="ta-interval-row">
               <input name="intervalMin" type="number" min="0" step="1" value="${escapeHtml(intervalValue)}" placeholder="如 302">
               <select name="intervalUnit" title="时间单位">
@@ -455,6 +502,7 @@ export class TimerAgentApp {
               </select>
             </span>
           </label>
+          `}
         </div>
         <label>超时(分钟,留空 = 默认 10)<input name="timeoutMin" type="number" min="0" step="1"
           value="${val('timeoutMin', job?.timeoutMs ? String(Math.round(job.timeoutMs / 60_000)) : '')}"></label>
@@ -467,7 +515,13 @@ export class TimerAgentApp {
         const schedBox = this.container.querySelector('.ta-field-sched');
         const enabledBox = form.querySelector('[name="enabled"]');
         if (schedBox !== null && enabledBox !== null) {
-            const syncSched = () => { schedBox.classList.toggle('ta-disabled', !enabledBox.checked); };
+            const syncSched = () => {
+                schedBox.classList.toggle('ta-disabled', !enabledBox.checked);
+                // 未勾选时模式下拉一并禁用(可见,不可选)。
+                const modeSelect = form.querySelector('[name="scheduleMode"]');
+                if (modeSelect !== null)
+                    modeSelect.disabled = !enabledBox.checked;
+            };
             enabledBox.addEventListener('change', syncSched);
         }
         // 收件箱开关:勾选时才显示优先级/难度/执行项目选择。
@@ -482,13 +536,17 @@ export class TimerAgentApp {
         }
         form.querySelector('[name="kind"]').addEventListener('change', event => {
             // Keep everything already typed; only the visible field set changes.
-            const data = new FormData(form);
-            const preserve = ['title', 'description', 'prompt', 'command', 'args', 'workdir', 'customWorkdir', 'cron', 'intervalMin', 'intervalUnit', 'timeoutMin', 'model', 'effort', 'tool', 'cliCommand', 'cliArgs', 'enabled', 'inbox', 'priority', 'difficulty', 'targetWs2', 'targetProject'];
-            this.formDraft = Object.fromEntries(preserve.map(name => [name, String(data.get(name) ?? '')]));
+            this.formDraft = this.captureFormDraft(form);
             this.formKind = event.target.value === 'command' ? 'command' : 'agent';
             this.renderForm();
         });
-        form.querySelector('[name="preset"]').addEventListener('change', event => {
+        // 执行模式下拉:切换时保留已输入的值,只换可见的定时字段集合。
+        form.querySelector('[name="scheduleMode"]')?.addEventListener('change', () => {
+            this.formDraft = this.captureFormDraft(form);
+            this.renderForm();
+        });
+        // 预设下拉仅 cron 模式渲染(一次性/固定间隔没有该字段)。
+        form.querySelector('[name="preset"]')?.addEventListener('change', event => {
             const value = event.target.value;
             if (value !== '') {
                 const cronInput = form.querySelector('[name="cron"]');
@@ -553,16 +611,24 @@ export class TimerAgentApp {
     }
     async submitForm(data, id) {
         const kind = data.get('kind') === 'command' ? 'command' : 'agent';
-        const cron = String(data.get('cron') ?? '').trim();
         const enabled = data.get('enabled') === 'on';
+        const scheduleMode = String(data.get('scheduleMode') ?? 'cron');
+        const cron = String(data.get('cron') ?? '').trim();
         const inbox = data.get('inbox') === 'on';
         const intervalMin = Number(data.get('intervalMin'));
         const unitMin = Number(data.get('intervalUnit') ?? 1) || 1;
-        const intervalMinutes = Number.isFinite(intervalMin) && intervalMin > 0 && unitMin > 0
+        const intervalMinutes = scheduleMode === 'interval' && Number.isFinite(intervalMin) && intervalMin > 0 && unitMin > 0
             ? Math.round(intervalMin * unitMin)
             : undefined;
-        if (!inbox && intervalMinutes === undefined && !isValidCron(cron)) {
-            window.alert('需要填写有效的 cron 表达式,或固定间隔数值');
+        // One-shot mode: the datetime-local draft becomes the run's ms epoch
+        // (sent as `runAt`; the server arms nextRunAt from it). Unparseable → block.
+        const onceRunAt = scheduleMode === 'once' ? new Date(String(data.get('onceValue') ?? '')).getTime() : undefined;
+        if (scheduleMode === 'once' && !Number.isFinite(onceRunAt)) {
+            window.alert('请选择一次性任务的执行时间');
+            return;
+        }
+        if (!inbox && intervalMinutes === undefined && onceRunAt === undefined && !isValidCron(cron)) {
+            window.alert('需要填写有效的 cron 表达式、固定间隔数值,或选择一次性执行时间');
             return;
         }
         const timeoutMin = Number(data.get('timeoutMin'));
@@ -593,7 +659,7 @@ export class TimerAgentApp {
             description: String(data.get('description') ?? ''),
             kind,
             workdir,
-            cron: intervalMinutes !== undefined ? '' : cron,
+            cron: scheduleMode === 'once' ? '' : intervalMinutes !== undefined ? '' : cron,
             enabled,
             inbox,
             ...(inbox ? {
@@ -617,6 +683,16 @@ export class TimerAgentApp {
             } : {}),
             ...(kind === 'command' ? { command: String(data.get('command') ?? ''), args: String(data.get('args') ?? '') } : {}),
             ...(intervalMinutes !== undefined ? { intervalMinutes } : {}),
+            // 编辑时切回 cron 模式:清掉遗留的固定间隔(intervalMinutes: 0 → 清除)。
+            ...(id !== undefined && scheduleMode === 'cron' && intervalMinutes === undefined ? { intervalMinutes: 0 } : {}),
+            // One-shot: create sends runAt (server arms nextRunAt from it); patch
+            // pins nextRunAt directly and clears a leftover interval so the edit
+            // can switch a recurring job over to one-shot mode.
+            ...(onceRunAt !== undefined && Number.isFinite(onceRunAt)
+                ? id === undefined
+                    ? { runAt: onceRunAt }
+                    : { intervalMinutes: 0, nextRunAt: onceRunAt }
+                : {}),
             ...(Number.isFinite(timeoutMin) && timeoutMin > 0 ? { timeoutMs: Math.round(timeoutMin * 60_000) } : {}),
         };
         try {
@@ -669,12 +745,21 @@ export class TimerAgentApp {
         <div class="ta-actions ta-row">
           <button class="ta-btn ta-primary" data-act="run">立即执行</button>
           <button class="ta-btn" data-act="edit">编辑</button>
-          ${schedule && schedule.nextRunAt !== undefined
+          ${schedule && schedule.nextRunAt !== undefined && !isOnce(schedule)
             ? `<button class="ta-btn" data-act="skip" title="跳过这一次,下次运行改为 ${formatTime(scheduleNextMs(schedule, schedule.nextRunAt) ?? undefined)}">跳过一次</button>` : ''}
           ${schedule ? `<button class="ta-btn" data-act="${schedule.enabled ? 'pause' : 'resume'}">${schedule.enabled ? '暂停调度' : '恢复调度'}</button>` : ''}
           <button class="ta-btn" data-act="${job.status === 'archived' ? 'restart' : 'archive'}">${job.status === 'archived' ? '恢复归档' : '归档'}</button>
           <button class="ta-btn ta-danger" data-act="delete">删除</button>
         </div>
+        ${schedule !== undefined && schedule.enabled && (isInterval(schedule) || isOnce(schedule)) ? `
+        <div class="ta-nextrun-row">
+          <span class="ta-muted">修改下次执行时间</span>
+          <input type="datetime-local" data-nextrun
+            value="${schedule.nextRunAt !== undefined ? localInputValue(new Date(schedule.nextRunAt)) : ''}"
+            aria-label="下次运行">
+          <button class="ta-btn" data-act="save-next">保存</button>
+          <span class="ta-muted">${isOnce(schedule) ? '一次性任务的执行时间可在这里手改' : '固定间隔任务会以此为锚点滚动'}</span>
+        </div>` : ''}
         <h3>执行历史</h3>
         <table class="ta-table"><thead><tr><th>开始</th><th>触发</th><th>结果</th><th>耗时</th><th>输出</th></tr></thead>
           <tbody>${executions || '<tr><td colspan="5" class="ta-muted">尚未执行</td></tr>'}</tbody></table>
@@ -682,6 +767,16 @@ export class TimerAgentApp {
         this.container.querySelector('[data-act="back"]')?.addEventListener('click', () => {
             this.selectedId = undefined;
             this.render();
+        });
+        // 保存手改的下次执行时间(仅固定间隔/一次性;cron 的时刻由表达式决定)。
+        this.container.querySelector('.ta-nextrun-row button[data-act="save-next"]')?.addEventListener('click', () => {
+            const input = this.container.querySelector('.ta-nextrun-row input[data-nextrun]');
+            const ms = input === null ? NaN : new Date(input.value).getTime();
+            if (!Number.isFinite(ms)) {
+                window.alert('请选择有效的日期时间');
+                return;
+            }
+            void this.listAction(id, 'save-next', ms);
         });
         for (const button of Array.from(this.container.querySelectorAll('.ta-actions button[data-act]'))) {
             button.addEventListener('click', () => void this.listAction(id, button.dataset.act));

@@ -1,7 +1,7 @@
 {
   "name": "timer-agent",
   "displayName": "Timer Agent",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Scheduled jobs with real 5-field cron: AI agent prompts (spawn a CLI) or plain command jobs, skip-once, run history.",
   "author": "louis",
   "icon": "icon.svg",
